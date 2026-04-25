@@ -64,3 +64,6 @@ project_overhaul_prompt.md
 
 # Companion app (tracked separately)
 apps/
+
+# Claude Code runtime artifacts
+.claude/scheduled_tasks.lock
