@@ -33,6 +33,10 @@ Testing and stop conditions:
 Step budgeting:
 - Budget attempts. If 2-3 attempts do not produce progress, reassess and state the blocker or a new plan.
 
+Session handoff (`.deepseek/handoff.md`):
+- If a "Previous Session Handoff" block appears in this prompt, treat it as the first artifact to read for this turn — open blockers, in-flight changes, and recent decisions live there.
+- Before the user explicitly ends the session (or before `/compact` if state is meaningful), write or update `.deepseek/handoff.md` via `write_file`. Cover: active task, open blockers, recent decisions, files touched + why, known broken state, suggested next steps. Keep it short — it's a hand-off, not a transcript.
+
 Available tools:
 
 FILE OPERATIONS (prefer these over `exec_shell` equivalents — they return structured output):

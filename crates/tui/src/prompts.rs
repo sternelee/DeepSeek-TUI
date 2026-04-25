@@ -9,6 +9,28 @@ use crate::project_context::{ProjectContext, load_project_context_with_parents};
 use crate::tui::app::AppMode;
 use std::path::Path;
 
+/// Conventional location for the structured session-handoff artifact (#32).
+/// A previous session writes it on exit / `/compact`; the next session reads
+/// it back on startup and prepends it to the system prompt so a fresh agent
+/// doesn't have to re-discover open blockers from scratch.
+pub const HANDOFF_RELATIVE_PATH: &str = ".deepseek/handoff.md";
+
+/// Read the workspace-local handoff artifact, if present, and format it as a
+/// system-prompt block. Returns `None` when the file is absent or empty so
+/// callers can keep the default-uncluttered prompt for fresh workspaces.
+fn load_handoff_block(workspace: &Path) -> Option<String> {
+    let path = workspace.join(HANDOFF_RELATIVE_PATH);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "## Previous Session Handoff\n\nThe previous session in this workspace left a handoff at `{}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{}",
+        HANDOFF_RELATIVE_PATH, trimmed
+    ))
+}
+
 // Prompt files loaded at compile time
 pub const BASE_PROMPT: &str = include_str!("prompts/base.txt");
 #[allow(dead_code)]
@@ -64,6 +86,10 @@ pub fn system_prompt_for_mode_with_context(
         full_prompt = format!("{full_prompt}\n\n{summary}");
     }
 
+    if let Some(handoff_block) = load_handoff_block(workspace) {
+        full_prompt = format!("{full_prompt}\n\n{handoff_block}");
+    }
+
     // Add compaction instruction for agent modes
     if matches!(mode, AppMode::Agent | AppMode::Yolo) {
         full_prompt.push_str(
@@ -113,6 +139,7 @@ pub fn plan_system_prompt() -> SystemPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn plan_prompt_prefers_best_effort_plans_over_clarifying_loops() {
@@ -126,5 +153,54 @@ mod tests {
         assert!(prompt.contains("do not browse the repo first"));
         assert!(prompt.contains("Do not ask clarifying questions for straightforward requests"));
         assert!(prompt.contains("If the user asks for \"a 3-step plan\""));
+    }
+
+    /// Discriminator unique to the injected handoff block (not present in the
+    /// agent prompt's own discussion of the convention).
+    const HANDOFF_BLOCK_MARKER: &str = "left a handoff at `.deepseek/handoff.md`";
+
+    #[test]
+    fn handoff_artifact_is_prepended_to_system_prompt_when_present() {
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        let handoff_dir = workspace.join(".deepseek");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::write(
+            handoff_dir.join("handoff.md"),
+            "# Session handoff — prior\n\n## Active task\nFinish #32.\n\n## Open blockers\n- [ ] write the basic version\n",
+        )
+        .unwrap();
+
+        let prompt = match system_prompt_for_mode_with_context(AppMode::Agent, workspace, None) {
+            SystemPrompt::Text(text) => text,
+            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
+        };
+
+        assert!(prompt.contains(HANDOFF_BLOCK_MARKER));
+        assert!(prompt.contains("Finish #32."));
+        assert!(prompt.contains("write the basic version"));
+    }
+
+    #[test]
+    fn missing_handoff_does_not_inject_block() {
+        let tmp = tempdir().expect("tempdir");
+        let prompt = match system_prompt_for_mode_with_context(AppMode::Agent, tmp.path(), None) {
+            SystemPrompt::Text(text) => text,
+            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
+        };
+        assert!(!prompt.contains(HANDOFF_BLOCK_MARKER));
+    }
+
+    #[test]
+    fn empty_handoff_file_does_not_inject_block() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join(".deepseek");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("handoff.md"), "   \n\n  ").unwrap();
+        let prompt = match system_prompt_for_mode_with_context(AppMode::Agent, tmp.path(), None) {
+            SystemPrompt::Text(text) => text,
+            SystemPrompt::Blocks(_) => panic!("expected text system prompt"),
+        };
+        assert!(!prompt.contains(HANDOFF_BLOCK_MARKER));
     }
 }
