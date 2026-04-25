@@ -2888,11 +2888,24 @@ impl Engine {
             // Update turn usage
             turn.add_usage(&usage);
 
-            // Build content blocks
-            if !current_thinking.is_empty() {
-                content_blocks.push(ContentBlock::Thinking {
-                    thinking: current_thinking.clone(),
-                });
+            // Build content blocks. If this assistant turn produced tool
+            // calls, ensure a Thinking block is present even when the model
+            // didn't stream any reasoning text — DeepSeek's thinking-mode
+            // API requires `reasoning_content` to accompany every tool-call
+            // assistant message in the conversation history. Saving a
+            // placeholder here keeps the on-disk session structurally
+            // correct so subsequent requests won't 400.
+            let needs_thinking_block = !tool_uses.is_empty()
+                || tool_parser::has_tool_call_markers(&current_text_raw);
+            let thinking_to_persist = if !current_thinking.is_empty() {
+                Some(current_thinking.clone())
+            } else if needs_thinking_block {
+                Some(String::from("(reasoning omitted)"))
+            } else {
+                None
+            };
+            if let Some(thinking) = thinking_to_persist {
+                content_blocks.push(ContentBlock::Thinking { thinking });
             }
             let mut final_text = current_text_visible.clone();
             if tool_uses.is_empty() && tool_parser::has_tool_call_markers(&current_text_raw) {

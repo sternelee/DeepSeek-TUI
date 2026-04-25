@@ -1351,7 +1351,6 @@ fn build_chat_messages_with_reasoning(
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let mut pending_tool_calls: HashSet<String> = HashSet::new();
-    let current_turn_start = messages.iter().rposition(is_text_user_message);
 
     if let Some(instructions) = system_to_instructions(system.cloned())
         && !instructions.trim().is_empty()
@@ -1362,7 +1361,7 @@ fn build_chat_messages_with_reasoning(
         }));
     }
 
-    for (message_index, message) in messages.iter().enumerate() {
+    for message in messages.iter() {
         let role = message.role.as_str();
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -1421,32 +1420,28 @@ fn build_chat_messages_with_reasoning(
 
         if role == "assistant" {
             let content = text_parts.join("\n");
-            let reasoning_content = thinking_parts.join("\n");
+            let mut reasoning_content = thinking_parts.join("\n");
             let has_text = !content.trim().is_empty();
-            let mut has_tool_calls = !tool_calls.is_empty();
-            let include_reasoning_for_turn = include_reasoning
-                && has_tool_calls
-                && current_turn_start.is_some_and(|start| message_index > start)
-                && !has_later_assistant_text(messages, message_index);
-            let has_reasoning = include_reasoning_for_turn && !reasoning_content.trim().is_empty();
-
-            // DeepSeek thinking-mode tool turns are stateful within the
-            // stateless Chat Completions transcript: if an assistant performed
-            // a tool call in the current user turn, its `reasoning_content`
-            // must be replayed while continuing that tool round. Once a new
-            // user text turn starts, DeepSeek recommends clearing historical
-            // reasoning content so the context is not dominated by old CoT.
-            // Older checkpoints could lose the current-round field because the
-            // UI display stream had no visible text block. Do not forward those
-            // malformed current tool calls; dropping that round is better than
-            // guaranteeing a provider-side 400.
+            let has_tool_calls = !tool_calls.is_empty();
+            // DeepSeek thinking-mode rule: any assistant message that performed
+            // a tool call must keep its `reasoning_content` and replay it in
+            // ALL subsequent requests, including across new user turns. Final
+            // text-only answers may drop reasoning_content (the API ignores
+            // it). If a tool-call round somehow lost its reasoning_content
+            // (e.g. a session checkpoint from before this rule was enforced,
+            // or a sub-turn where the model emitted no reasoning text),
+            // substitute a non-empty placeholder so the API accepts the
+            // request. Dropping tool_calls instead would orphan matching
+            // tool_results and fragment the conversation chain.
+            let include_reasoning_for_turn = include_reasoning && has_tool_calls;
+            let mut has_reasoning =
+                include_reasoning_for_turn && !reasoning_content.trim().is_empty();
             if include_reasoning_for_turn && !has_reasoning {
                 logging::warn(
-                    "Dropping DeepSeek tool_calls with missing reasoning_content from assistant message",
+                    "Substituting placeholder reasoning_content for DeepSeek tool-call assistant message",
                 );
-                tool_calls.clear();
-                tool_call_ids.clear();
-                has_tool_calls = false;
+                reasoning_content = String::from("(reasoning omitted)");
+                has_reasoning = true;
             }
 
             // DeepSeek rejects assistant messages where both `content` and
@@ -1616,33 +1611,6 @@ fn build_chat_messages_with_reasoning(
     }
 
     out
-}
-
-fn is_text_user_message(message: &Message) -> bool {
-    message.role == "user"
-        && message.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::Text { text, .. } if !text.trim().is_empty()
-            )
-        })
-}
-
-fn has_later_assistant_text(messages: &[Message], message_index: usize) -> bool {
-    messages
-        .iter()
-        .skip(message_index.saturating_add(1))
-        .any(is_text_assistant_message)
-}
-
-fn is_text_assistant_message(message: &Message) -> bool {
-    message.role == "assistant"
-        && message.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::Text { text, .. } if !text.trim().is_empty()
-            )
-        })
 }
 
 fn tool_to_chat(tool: &Tool) -> Value {
@@ -2437,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_messages_clear_prior_tool_round_reasoning_after_new_user_turn() {
+    fn chat_messages_replay_prior_tool_round_reasoning_after_new_user_turn() {
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -2485,16 +2453,24 @@ mod tests {
             },
         ];
         let out = build_chat_messages(None, &messages, "deepseek-v4-pro");
-        let assistant = out
+        let tool_assistant = out
             .iter()
-            .find(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
-            .expect("assistant message");
-        assert!(assistant.get("tool_calls").is_some());
-        assert!(assistant.get("reasoning_content").is_none());
+            .find(|value| {
+                value.get("role").and_then(Value::as_str) == Some("assistant")
+                    && value.get("tool_calls").is_some()
+            })
+            .expect("tool-call assistant message");
+        assert_eq!(
+            tool_assistant
+                .get("reasoning_content")
+                .and_then(Value::as_str),
+            Some("Need to call a tool"),
+            "DeepSeek thinking mode requires reasoning_content to be replayed for tool-call rounds across all subsequent user turns"
+        );
     }
 
     #[test]
-    fn chat_messages_clear_completed_tool_round_reasoning_after_final_answer() {
+    fn chat_messages_replay_completed_tool_round_reasoning_after_final_answer() {
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -2535,16 +2511,31 @@ mod tests {
             },
         ];
         let out = build_chat_messages(None, &messages, "deepseek-v4-pro");
-        let assistant = out
+        let tool_assistant = out
             .iter()
-            .find(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
-            .expect("assistant message");
-        assert!(assistant.get("tool_calls").is_some());
-        assert!(assistant.get("reasoning_content").is_none());
+            .find(|value| {
+                value.get("role").and_then(Value::as_str) == Some("assistant")
+                    && value.get("tool_calls").is_some()
+            })
+            .expect("tool-call assistant message");
+        assert_eq!(
+            tool_assistant
+                .get("reasoning_content")
+                .and_then(Value::as_str),
+            Some("Need to call a tool")
+        );
+        let final_assistant = out
+            .iter()
+            .rfind(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("final assistant message");
+        assert!(
+            final_assistant.get("reasoning_content").is_none(),
+            "final text answer can drop reasoning_content (API ignores it)"
+        );
     }
 
     #[test]
-    fn chat_messages_clear_v4_tool_round_reasoning_after_new_user_turn() {
+    fn chat_messages_replay_v4_tool_round_reasoning_after_new_user_turn() {
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -2593,16 +2584,23 @@ mod tests {
         ];
 
         let out = build_chat_messages(None, &messages, "deepseek-v4-pro");
-        let assistant = out
+        let tool_assistant = out
             .iter()
-            .find(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
-            .expect("assistant message");
-        assert!(assistant.get("tool_calls").is_some());
-        assert!(assistant.get("reasoning_content").is_none());
+            .find(|value| {
+                value.get("role").and_then(Value::as_str) == Some("assistant")
+                    && value.get("tool_calls").is_some()
+            })
+            .expect("tool-call assistant message");
+        assert_eq!(
+            tool_assistant
+                .get("reasoning_content")
+                .and_then(Value::as_str),
+            Some("Need a tool for this")
+        );
     }
 
     #[test]
-    fn chat_messages_drop_v4_tool_round_missing_reasoning() {
+    fn chat_messages_substitute_placeholder_when_v4_tool_round_missing_reasoning() {
         let messages = vec![
             Message {
                 role: "user".to_string(),
@@ -2633,15 +2631,24 @@ mod tests {
 
         let out = build_chat_messages(None, &messages, "deepseek-v4-pro");
 
+        let assistant = out
+            .iter()
+            .find(|value| {
+                value.get("role").and_then(Value::as_str) == Some("assistant")
+                    && value.get("tool_calls").is_some()
+            })
+            .expect("tool-call assistant message should be retained with placeholder");
         assert!(
-            !out.iter()
-                .any(|value| value.get("role").and_then(Value::as_str) == Some("assistant")),
-            "malformed assistant tool round should be removed"
+            assistant
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty()),
+            "missing reasoning_content should be substituted with a non-empty placeholder so the API accepts the request"
         );
         assert!(
-            !out.iter()
+            out.iter()
                 .any(|value| value.get("role").and_then(Value::as_str) == Some("tool")),
-            "tool result tied to missing reasoning should be removed"
+            "matching tool_result must remain so the conversation chain stays intact"
         );
     }
 

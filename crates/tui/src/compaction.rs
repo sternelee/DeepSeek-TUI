@@ -523,28 +523,13 @@ fn estimate_tokens_for_message(message: &Message, include_thinking: bool) -> usi
 }
 
 pub fn estimate_tokens(messages: &[Message]) -> usize {
-    // Rough estimate: ~4 chars per token
-    let current_turn_start = messages.iter().rposition(is_text_user_message);
+    // Rough estimate: ~4 chars per token. DeepSeek thinking-mode rule: any
+    // assistant message with tool_calls keeps its reasoning_content forever
+    // (replayed in all subsequent requests). Final text-only answers drop it.
     messages
         .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let include_thinking = current_turn_start.is_some_and(|start| index > start)
-                && message_has_tool_use(message)
-                && !has_later_assistant_text(messages, index);
-            estimate_tokens_for_message(message, include_thinking)
-        })
+        .map(|message| estimate_tokens_for_message(message, message_has_tool_use(message)))
         .sum()
-}
-
-fn is_text_user_message(message: &Message) -> bool {
-    message.role == "user"
-        && message.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::Text { text, .. } if !text.trim().is_empty()
-            )
-        })
 }
 
 fn message_has_tool_use(message: &Message) -> bool {
@@ -552,23 +537,6 @@ fn message_has_tool_use(message: &Message) -> bool {
         .content
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
-}
-
-fn has_later_assistant_text(messages: &[Message], message_index: usize) -> bool {
-    messages
-        .iter()
-        .skip(message_index.saturating_add(1))
-        .any(is_text_assistant_message)
-}
-
-fn is_text_assistant_message(message: &Message) -> bool {
-    message.role == "assistant"
-        && message.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::Text { text, .. } if !text.trim().is_empty()
-            )
-        })
 }
 
 fn estimate_text_tokens_conservative(text: &str) -> usize {
@@ -1158,7 +1126,11 @@ mod tests {
     }
 
     #[test]
-    fn estimate_tokens_counts_current_tool_round_thinking_only() {
+    fn estimate_tokens_counts_tool_round_thinking_across_turns() {
+        // Per DeepSeek thinking-mode rules, any assistant message that
+        // performed a tool call keeps its reasoning_content in the request
+        // forever, including across new user turns. Token estimates must
+        // count those bytes.
         let thinking = "reasoning ".repeat(800);
         let current_messages = vec![
             Message {
@@ -1222,9 +1194,10 @@ mod tests {
             messages
         };
 
-        assert!(estimate_tokens(&current_messages) > thinking.len() / 5);
-        assert!(estimate_tokens(&completed_messages) < thinking.len() / 8);
-        assert!(estimate_tokens(&historical_messages) < thinking.len() / 8);
+        let lower_bound = thinking.len() / 5;
+        assert!(estimate_tokens(&current_messages) > lower_bound);
+        assert!(estimate_tokens(&completed_messages) > lower_bound);
+        assert!(estimate_tokens(&historical_messages) > lower_bound);
     }
 
     #[test]

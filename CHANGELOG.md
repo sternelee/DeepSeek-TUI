@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-04-27
+
+### Fixed
+- DeepSeek thinking-mode tool-call rounds now always replay `reasoning_content` in all subsequent requests (including across new user turns), matching DeepSeek's documented API contract that assistant messages with tool calls must retain their reasoning content forever.
+- Missing `reasoning_content` on a tool-call assistant message now substitutes a safe placeholder (`"(reasoning omitted)"`) instead of dropping the tool calls and their matching tool results, preventing orphaned conversation chains and API 400 errors.
+- Session checkpoint now persists a Thinking-block placeholder for tool-call turns that produced no streamed reasoning text, keeping on-disk sessions structurally correct so subsequent requests avoid HTTP 400 rejections.
+- Token estimation for compaction now counts thinking tokens across all tool-call rounds (not just the current user turn), aligning with the updated reasoning_content replay rule.
+
 ## [0.4.8] - 2026-04-25
 
 ### Fixed
@@ -490,7 +498,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hooks system and config profiles
 - Example skills and launch assets
 
-[Unreleased]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.3.33...HEAD
+[Unreleased]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.4.9...HEAD
+[0.4.9]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.4.8...v0.4.9
+[0.4.8]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.3.33...v0.4.8
 [0.3.33]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.3.32...v0.3.33
 [0.3.32]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.3.31...v0.3.32
 [0.3.31]: https://github.com/Hmbown/DeepSeek-TUI/compare/v0.3.28...v0.3.31
