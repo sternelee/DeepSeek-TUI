@@ -29,9 +29,12 @@ use crate::tui::scrolling::TranscriptLineMeta;
 ///
 /// Lines are stored behind an `Arc` so that cloning a `CachedCell` during
 /// cache-ensure (which touches every cell every frame) is O(1) rather than
-/// O(rendered_line_count). The flatten step uses `Arc::make_mut` to produce
-/// an owned `Vec` for the final `lines` assembly, so the only deep-clone
-/// occurs on the flattened output — once per frame instead of once per cell.
+/// O(rendered_line_count). Without this, scrolling on a long transcript
+/// pays the cost of deep-cloning every cell's `Vec<Line>` per frame, which
+/// is the surface-level symptom of issue #78. The flatten step uses
+/// `Arc::make_mut` to produce an owned `Vec` for the final `lines`
+/// assembly, so the only deep-clone occurs on the flattened output — once
+/// per frame instead of once per cell.
 #[derive(Debug, Clone)]
 struct CachedCell {
     /// Revision the cell was at when the lines/meta were rendered.
@@ -89,6 +92,11 @@ impl TranscriptViewCache {
     /// `cell_revisions.len()` is expected to equal `cells.len()`. If they
     /// disagree (shouldn't happen in normal use) the cache treats every cell
     /// as dirty.
+    ///
+    /// Retained for tests and external use; the live render path uses the
+    /// `ensure_split` variant to avoid concatenating history + active-cell
+    /// entries every frame.
+    #[allow(dead_code)]
     pub fn ensure(
         &mut self,
         cells: &[HistoryCell],
@@ -96,6 +104,22 @@ impl TranscriptViewCache {
         width: u16,
         options: TranscriptRenderOptions,
     ) {
+        self.ensure_split(&[cells], cell_revisions, width, options);
+    }
+
+    /// Ensure cached lines match the provided cell shards (logically
+    /// concatenated) plus per-cell revisions. Avoids the
+    /// `concat-into-Vec<HistoryCell>` clone the caller would otherwise pay
+    /// every frame on long transcripts.
+    pub fn ensure_split(
+        &mut self,
+        cell_shards: &[&[HistoryCell]],
+        cell_revisions: &[u64],
+        width: u16,
+        options: TranscriptRenderOptions,
+    ) {
+        let total_cells: usize = cell_shards.iter().map(|s| s.len()).sum();
+
         let layout_changed = self.width != width || self.options != options;
         if layout_changed {
             self.per_cell.clear();
@@ -105,46 +129,51 @@ impl TranscriptViewCache {
 
         // Track whether anything actually changed; if all cells are reused at
         // the same indices, we can skip the reflatten.
-        let mut any_dirty = layout_changed || self.per_cell.len() != cells.len();
+        let mut any_dirty = layout_changed || self.per_cell.len() != total_cells;
 
-        let mut new_per_cell: Vec<CachedCell> = Vec::with_capacity(cells.len());
-        let revisions_match = cell_revisions.len() == cells.len();
+        let mut new_per_cell: Vec<CachedCell> = Vec::with_capacity(total_cells);
+        let revisions_match = cell_revisions.len() == total_cells;
 
-        for (idx, cell) in cells.iter().enumerate() {
-            let current_rev = if revisions_match {
-                cell_revisions[idx]
-            } else {
-                // No matching revisions — force a re-render this cycle.
-                u64::MAX
-            };
+        let mut idx: usize = 0;
+        for shard in cell_shards {
+            for cell in *shard {
+                let current_rev = if revisions_match {
+                    cell_revisions[idx]
+                } else {
+                    // No matching revisions — force a re-render this cycle.
+                    u64::MAX
+                };
 
-            // Reuse cached entry if the revision matches AND it's at the same
-            // index (since cells can shift on insert/remove, we only reuse
-            // when the index is identical — a stricter invariant codex also
-            // uses for its active-cell tail).
-            if let Some(prev) = self.per_cell.get(idx)
-                && !layout_changed
-                && prev.revision == current_rev
-                && revisions_match
-            {
-                new_per_cell.push(prev.clone());
-                continue;
+                // Reuse cached entry if the revision matches AND it's at the
+                // same index (cells can shift on insert/remove, so we only
+                // reuse when the index is identical — a stricter invariant
+                // codex also uses for its active-cell tail).
+                if let Some(prev) = self.per_cell.get(idx)
+                    && !layout_changed
+                    && prev.revision == current_rev
+                    && revisions_match
+                {
+                    new_per_cell.push(prev.clone());
+                    idx += 1;
+                    continue;
+                }
+
+                any_dirty = true;
+                let rendered = cell.lines_with_options(width, options);
+                let is_empty = rendered.is_empty();
+                new_per_cell.push(CachedCell {
+                    revision: current_rev,
+                    lines: Arc::new(rendered),
+                    is_empty,
+                    is_stream_continuation: cell.is_stream_continuation(),
+                    is_conversational: cell.is_conversational(),
+                    is_system_or_tool: matches!(
+                        cell,
+                        HistoryCell::System { .. } | HistoryCell::Tool(_)
+                    ),
+                });
+                idx += 1;
             }
-
-            any_dirty = true;
-            let rendered = cell.lines_with_options(width, options);
-            let is_empty = rendered.is_empty();
-            new_per_cell.push(CachedCell {
-                revision: current_rev,
-                lines: Arc::new(rendered),
-                is_empty,
-                is_stream_continuation: cell.is_stream_continuation(),
-                is_conversational: cell.is_conversational(),
-                is_system_or_tool: matches!(
-                    cell,
-                    HistoryCell::System { .. } | HistoryCell::Tool(_)
-                ),
-            });
         }
 
         self.per_cell = new_per_cell;

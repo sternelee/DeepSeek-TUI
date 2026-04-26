@@ -181,8 +181,8 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
                     app.system_prompt = Some(SystemPrompt::Text(prompt));
                 }
                 // Convert saved messages to HistoryCell format for display
-                app.history.clear();
-                app.history.push(HistoryCell::System {
+                app.clear_history();
+                app.push_history_cell(HistoryCell::System {
                     content: format!(
                         "Resumed session: {} ({})",
                         saved.metadata.title,
@@ -191,7 +191,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
                 });
 
                 for msg in &saved.messages {
-                    app.history.extend(history_cells_from_message(msg));
+                    app.extend_history(history_cells_from_message(msg));
                 }
                 app.mark_history_updated();
                 app.status_message = Some(format!(
@@ -403,6 +403,11 @@ async fn run_event_loop(
                             {
                                 *streaming = false;
                             }
+                            // Streaming flag flipped — the cell's compact /
+                            // transcript variants render slightly
+                            // differently, so bump its revision so the cache
+                            // refreshes this row only.
+                            app.bump_history_cell(index);
                             transcript_batch_updated = true;
                         }
 
@@ -974,11 +979,13 @@ async fn run_event_loop(
 
             if let Event::Resize(width, height) = evt {
                 tracing::debug!(width, height, "Event::Resize received; clearing terminal");
-                // Coalesce queued resize events so we only act on the final
-                // size. Rapid drag-resizes can produce many intermediate
-                // events; processing each one with its own clear+redraw
-                // amplifies the artifact window. Drain the queue here, keep
-                // only the final dimensions, and issue a single clear+draw.
+                // Drain any further Resize events queued in this poll cycle so we
+                // act on the final size only, then issue a single clear + redraw.
+                // crossterm coalesces some resize events but rapid drag-resizes
+                // can still queue several; processing them all here avoids the
+                // common "stale art on the right edge" symptom (#65) caused by
+                // the diff renderer skipping cells that match a stale back
+                // buffer between intermediate sizes.
                 let mut final_w = width;
                 let mut final_h = height;
                 while event::poll(Duration::from_millis(0)).unwrap_or(false) {
@@ -988,6 +995,9 @@ async fn run_event_loop(
                             final_h = h;
                         }
                         Ok(other) => {
+                            // Non-resize event during the drain: we can't
+                            // un-read it. Drop it and let the user re-issue
+                            // — the resize-coalesce window is tiny.
                             tracing::debug!(
                                 ?other,
                                 "non-resize event during resize coalesce; dropping"
@@ -999,9 +1009,10 @@ async fn run_event_loop(
                 }
                 terminal.clear()?;
                 app.handle_resize(final_w, final_h);
-                // Repaint immediately. Without this, the cleared screen can
-                // sit blank until the next event triggers another draw,
-                // which presents as a flicker or stale frame to the user.
+                // Draw immediately so the cleared screen gets repainted before
+                // any other events can interleave. Without this, the next
+                // iteration's draw can race against fast follow-up input and
+                // leave the user staring at a blank/partial frame.
                 terminal.draw(|f| render(f, app))?;
                 app.needs_redraw = false;
                 continue;
@@ -1745,6 +1756,12 @@ fn append_streaming_text(app: &mut App, index: usize, text: &str) {
     }
     if let Some(HistoryCell::Assistant { content, .. }) = app.history.get_mut(index) {
         content.push_str(text);
+        // Bump only the streaming cell's per-cell revision so the transcript
+        // cache re-renders just this cell. Without this, the cache would
+        // either skip the update entirely (now that the global
+        // history_version is no longer fanned out across every cell) or fall
+        // back to a full re-wrap of the entire transcript every chunk.
+        app.bump_history_cell(index);
     }
 }
 
@@ -2910,7 +2927,7 @@ async fn handle_view_events(
 
 fn apply_loaded_session(app: &mut App, session: &SavedSession) {
     app.api_messages.clone_from(&session.messages);
-    app.history.clear();
+    app.clear_history();
     app.tool_cells.clear();
     app.tool_details_by_cell.clear();
     app.active_cell = None;
@@ -2922,9 +2939,12 @@ fn apply_loaded_session(app: &mut App, session: &SavedSession) {
     app.pending_tool_uses.clear();
     app.last_exec_wait_command = None;
 
-    for msg in &app.api_messages {
-        app.history.extend(history_cells_from_message(msg));
-    }
+    let cells_to_add: Vec<_> = app
+        .api_messages
+        .iter()
+        .flat_map(history_cells_from_message)
+        .collect();
+    app.extend_history(cells_to_add);
     app.mark_history_updated();
     app.transcript_selection.clear();
     app.model.clone_from(&session.metadata.model);
@@ -3661,8 +3681,8 @@ pub(crate) fn truncate_line_to_width(text: &str, max_width: usize) -> String {
         return text.to_string();
     }
     // For very small budgets, take chars until we exceed the *display* width.
-    // The previous implementation counted codepoints, which overran the
-    // budget for any double-width grapheme and contributed to mid-character
+    // Counting characters instead of widths (the previous behavior) overran
+    // the budget for any double-width grapheme and contributed to mid-character
     // sidebar artifacts on resize (issue #65).
     if max_width <= 3 {
         let mut out = String::new();

@@ -83,10 +83,13 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
     };
 
     app.api_messages.clone_from(&session.messages);
-    app.history.clear();
-    for msg in &app.api_messages {
-        app.history.extend(history_cells_from_message(msg));
-    }
+    app.clear_history();
+    let cells_to_add: Vec<_> = app
+        .api_messages
+        .iter()
+        .flat_map(history_cells_from_message)
+        .collect();
+    app.extend_history(cells_to_add);
     app.mark_history_updated();
     app.transcript_selection.clear();
     app.model.clone_from(&session.metadata.model);

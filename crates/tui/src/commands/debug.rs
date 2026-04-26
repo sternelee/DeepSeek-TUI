@@ -358,7 +358,7 @@ pub fn undo(app: &mut App) -> CommandResult {
     let mut removed_count = 0;
     while !app.history.is_empty() {
         let last_is_user = matches!(app.history.last(), Some(HistoryCell::User { .. }));
-        app.history.pop();
+        app.pop_history();
         removed_count += 1;
         if last_is_user {
             break;

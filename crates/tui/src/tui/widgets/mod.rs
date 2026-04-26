@@ -66,38 +66,50 @@ impl ChatWidget {
             };
         }
 
-        // The transcript cache exposes a per-cell revision slice for fine
-        // grained caching; until App tracks per-cell revisions explicitly,
-        // we synthesize a uniform slice from the global history_version so
-        // any mutation invalidates every cell (matches the pre-cache
-        // semantics).
+        // Per-cell revision caching (fix for issue #78):
+        //
+        // Every committed history cell carries its own revision counter in
+        // `app.history_revisions`. The transcript cache compares each cell's
+        // current revision against the previously rendered one, so unchanged
+        // cells reuse their cached wrapped lines instead of being re-wrapped
+        // every frame. This is the difference between O(history.len()) and
+        // O(changed_cells) per render — and was the root cause of scroll lag
+        // on long transcripts.
         //
         // The active in-flight cell (if any) is appended as the last cell so
         // its mutations show up at the live tail. Each entry inside the
         // active cell becomes a virtual cell at index `history.len() + i`,
-        // matching `App::cell_at_virtual_index`. Active-cell entries get a
-        // distinct revision derived from `active_cell_revision` so changes to
-        // them only re-render those rows.
+        // matching `App::cell_at_virtual_index`. Active-cell entries share
+        // the same `active_cell_revision` salt so any mutation in the active
+        // cell forces only those rows to re-render — committed history rows
+        // are unaffected.
+        app.resync_history_revisions();
         let active_entries: &[HistoryCell] = app
             .active_cell
             .as_ref()
             .map_or(&[], |active| active.entries());
-        let mut combined_cells: Vec<HistoryCell> =
+        // Build the per-cell revision slice without cloning history cells.
+        // History cells reuse `app.history_revisions` directly; active-cell
+        // entries fall back to a synthetic revision derived from
+        // `active_cell_revision` (active cells don't carry their own
+        // per-entry counter today).
+        let mut cell_revisions: Vec<u64> =
             Vec::with_capacity(app.history.len() + active_entries.len());
-        combined_cells.extend_from_slice(&app.history);
-        combined_cells.extend_from_slice(active_entries);
-        let mut cell_revisions = vec![app.history_version; combined_cells.len()];
-        // Salt the active-cell revisions with `active_cell_revision` so they
-        // invalidate independently of the history version when only the
-        // active cell mutates.
+        cell_revisions.extend_from_slice(&app.history_revisions);
         if !active_entries.is_empty() {
             let active_rev = app.active_cell_revision;
-            for rev in cell_revisions.iter_mut().skip(app.history.len()) {
-                *rev = rev.wrapping_add(active_rev.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            for i in 0..active_entries.len() {
+                let salt = (i as u64).wrapping_add(1);
+                cell_revisions.push(
+                    active_rev
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(salt),
+                );
             }
         }
-        app.transcript_cache.ensure(
-            &combined_cells,
+        let shards: [&[HistoryCell]; 2] = [&app.history, active_entries];
+        app.transcript_cache.ensure_split(
+            &shards,
             &cell_revisions,
             content_area.width.max(1),
             render_options,
@@ -1689,13 +1701,14 @@ mod tests {
     }
 
     /// Regression for issue #65: after `App::handle_resize`, the chat widget
-    /// must produce a clean render at the new width — no panic, and a
-    /// populated history must yield non-empty rendered cells. Cycling
-    /// through several widths (shrinks and grows) flushes any cached layout
-    /// that fails to invalidate on resize.
+    /// must produce a clean render at the new width — no stale wrapping,
+    /// no panic, no content exceeding the requested width. Cycling through
+    /// several widths (shrinks and grows) flushes any cached layout that
+    /// fails to invalidate on resize.
     #[test]
     fn chat_widget_renders_cleanly_after_resize_cycle() {
         let mut app = create_test_app();
+        // Add some long content that wraps differently at different widths.
         for i in 0..40 {
             app.add_message(HistoryCell::User {
                 content: format!("user message {i} with enough text to wrap at 30 columns easily"),
@@ -1705,6 +1718,7 @@ mod tests {
         let widths_to_cycle = [120u16, 80, 40, 60, 100, 30];
         let height: u16 = 20;
         for width in widths_to_cycle {
+            // Caller-side: simulate the resize handler invalidating caches.
             app.handle_resize(width, height);
             let area = Rect {
                 x: 0,
@@ -1716,6 +1730,10 @@ mod tests {
             let widget = ChatWidget::new(&mut app, area);
             widget.render(area, &mut buf);
 
+            // The render must produce at least some non-empty content for a
+            // populated history at any reasonable width. This catches a class
+            // of resize regressions where stale layout state leaves a blank
+            // viewport after a width change.
             let mut non_empty = 0usize;
             for y in 0..height {
                 for x in 0..width {
@@ -1733,7 +1751,7 @@ mod tests {
     }
 
     /// Regression for issue #65: the transcript view cache must invalidate
-    /// when width changes, so the same `App.history` re-wraps at the new
+    /// when width changes, so the same `App.history` re-wraps to the new
     /// width on the very next `ChatWidget::new` call.
     #[test]
     fn transcript_cache_invalidates_on_width_change() {
@@ -1761,6 +1779,8 @@ mod tests {
         widget_wide.render(area_wide, &mut buf_wide);
         let wide_total_lines = app.transcript_cache.total_lines();
 
+        // Without an explicit resize call, just shrinking the render area
+        // should still trigger a cache rebuild because the cache keys on width.
         let mut buf_narrow = Buffer::empty(area_narrow);
         let widget_narrow = ChatWidget::new(&mut app, area_narrow);
         widget_narrow.render(area_narrow, &mut buf_narrow);
@@ -1770,5 +1790,119 @@ mod tests {
             narrow_total_lines > wide_total_lines,
             "narrow render should produce more wrapped lines (got {narrow_total_lines}, wide={wide_total_lines})"
         );
+    }
+
+    /// Issue #78 — perf bench for transcript scroll lag.
+    ///
+    /// Builds a 5000-entry history (mix of user / assistant / a few tool
+    /// cells), then times `ChatWidget::new` at scroll offsets 0, 100, 500,
+    /// and 2000 lines from the tail. The first call after history mutation
+    /// pays the wrap cost; subsequent calls at different offsets should hit
+    /// the per-cell cache and be ~constant time regardless of offset.
+    ///
+    /// Run with: `cargo test -p deepseek-tui --release bench_transcript_scroll
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf bench; run with --release"]
+    fn bench_transcript_scroll_5000_messages() {
+        use std::time::Instant;
+
+        let mut app = create_test_app();
+        // 5000 cells: alternating user / assistant with realistic-ish bodies
+        // so wrapping cost is non-trivial. Every 50th cell is a (small)
+        // generic tool cell, mirroring real transcripts.
+        for i in 0..5000usize {
+            let cell = if i % 50 == 49 {
+                HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                    name: "grep_files".to_string(),
+                    status: ToolStatus::Success,
+                    input_summary: Some(format!("query: hit-{i}")),
+                    output: Some(format!("found 12 matches in cell-{i}")),
+                    prompts: None,
+                }))
+            } else if i % 2 == 0 {
+                HistoryCell::User {
+                    content: format!(
+                        "user message {i}: please review the changes in src/foo/bar.rs and \
+                         tell me whether the new error handling looks reasonable"
+                    ),
+                }
+            } else {
+                HistoryCell::Assistant {
+                    content: format!(
+                        "Sure — looking at src/foo/bar.rs in cell {i}, the new error \
+                         handling wraps each fallible call in `?` and propagates a \
+                         typed `FooError`. That looks fine, but consider whether the \
+                         `Display` impl needs to redact the inner path."
+                    ),
+                    streaming: false,
+                }
+            };
+            app.add_message(cell);
+        }
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        };
+
+        // Warm-up: first call after a full history build pays the wrap cost
+        // for every cell. We don't time this — it's amortized across the
+        // session and is not the user-visible problem.
+        let _ = ChatWidget::new(&mut app, area);
+
+        let visible = area.height as usize;
+        // For each scroll target, snap the scroll position there and measure
+        // a fresh ChatWidget::new(). The cache should hit for all unchanged
+        // cells, so the time should be roughly constant regardless of
+        // offset.
+        for offset_from_tail in [0usize, 100, 500, 2000] {
+            let total = app.transcript_cache.total_lines();
+            let max_start = total.saturating_sub(visible);
+            let target = max_start.saturating_sub(offset_from_tail);
+            app.transcript_scroll = crate::tui::scrolling::TranscriptScroll::at_line(target);
+
+            let iters: u32 = 10;
+            let start = Instant::now();
+            for _ in 0..iters {
+                let _ = ChatWidget::new(&mut app, area);
+            }
+            let elapsed = start.elapsed();
+            let per_call_us = elapsed.as_micros() / u128::from(iters);
+            println!(
+                "[bench_transcript_scroll] offset={offset_from_tail:>5} \
+                 per_render={per_call_us:>6} \u{3bc}s  ({:>3} ms / {iters} iters)",
+                elapsed.as_millis()
+            );
+        }
+
+        // Streaming-delta scenario: append one assistant cell at the tail
+        // and time a render. The cache should re-render only the new cell,
+        // NOT every cell — even at deep scroll.
+        for offset_from_tail in [0usize, 2000] {
+            let total = app.transcript_cache.total_lines();
+            let max_start = total.saturating_sub(visible);
+            let target = max_start.saturating_sub(offset_from_tail);
+            app.transcript_scroll = crate::tui::scrolling::TranscriptScroll::at_line(target);
+
+            let iters: u32 = 10;
+            let start = Instant::now();
+            for i in 0..iters {
+                app.add_message(HistoryCell::Assistant {
+                    content: format!("delta {i}"),
+                    streaming: false,
+                });
+                let _ = ChatWidget::new(&mut app, area);
+            }
+            let elapsed = start.elapsed();
+            let per_call_us = elapsed.as_micros() / u128::from(iters);
+            println!(
+                "[bench_transcript_scroll] streaming offset={offset_from_tail:>5} \
+                 per_render={per_call_us:>6} \u{3bc}s  ({:>3} ms / {iters} iters)",
+                elapsed.as_millis()
+            );
+        }
     }
 }

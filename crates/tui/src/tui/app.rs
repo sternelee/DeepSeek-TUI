@@ -367,6 +367,21 @@ pub struct App {
     pub paste_burst: PasteBurst,
     pub history: Vec<HistoryCell>,
     pub history_version: u64,
+    /// Per-cell revision counter, kept in lockstep with `history`. Bumped only
+    /// for the cell whose content actually changed; appended (with a fresh
+    /// value) when a new cell is pushed; truncated when cells are removed. The
+    /// transcript cache compares each entry against its previously rendered
+    /// revision to skip re-wrap on unchanged cells.
+    ///
+    /// Critical for transcript scroll perf (issue #78): without per-cell
+    /// revisions, every history mutation forces a full re-render of every
+    /// cell, which scales O(N) with transcript length and stalls the UI when
+    /// scrolled far back.
+    pub history_revisions: Vec<u64>,
+    /// Monotonic counter used to issue fresh per-cell revisions. Wrapping is
+    /// fine — the chance of a wrap-around revision collision in a single
+    /// session is astronomical.
+    pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
     pub transcript_scroll: TranscriptScroll,
     pub pending_scroll_delta: i32,
@@ -723,6 +738,8 @@ impl App {
             paste_burst: PasteBurst::default(),
             history: Vec::new(),
             history_version: 0,
+            history_revisions: Vec::new(),
+            next_history_revision: 1,
             api_messages: Vec::new(),
             transcript_scroll: TranscriptScroll::to_bottom(),
             pending_scroll_delta: 0,
@@ -968,7 +985,9 @@ impl App {
     }
 
     pub fn add_message(&mut self, msg: HistoryCell) {
+        let rev = self.fresh_history_revision();
         self.history.push(msg);
+        self.history_revisions.push(rev);
         self.history_version = self.history_version.wrapping_add(1);
         let selection_has_range = self
             .transcript_selection
@@ -993,7 +1012,102 @@ impl App {
 
     pub fn mark_history_updated(&mut self) {
         self.history_version = self.history_version.wrapping_add(1);
+        // Resync per-cell revisions to history.len(). This is the
+        // "I-don't-know-which-cell-changed" path: if cells were appended in
+        // bulk (e.g. session resume, compaction), every new cell gets a
+        // fresh revision; if cells were removed, drop trailing revs. We
+        // intentionally do NOT bump revisions for indices that already had
+        // one — the cache will reuse those. Callers that mutate a specific
+        // cell's content must call `bump_history_cell(idx)` instead.
+        self.resync_history_revisions();
         self.needs_redraw = true;
+    }
+
+    /// Issue a fresh, monotonically increasing revision counter for a new
+    /// history cell. Wrapping is acceptable — collisions are astronomically
+    /// rare and at worst trigger one extra re-render.
+    fn fresh_history_revision(&mut self) -> u64 {
+        let rev = self.next_history_revision;
+        self.next_history_revision = self.next_history_revision.wrapping_add(1);
+        rev
+    }
+
+    /// Bring `history_revisions` back into shape (`history_revisions.len() ==
+    /// history.len()`). Pushes fresh revs for newly appended cells, truncates
+    /// for cells that were removed. **Does not** invalidate existing entries.
+    pub fn resync_history_revisions(&mut self) {
+        if self.history_revisions.len() < self.history.len() {
+            let needed = self.history.len() - self.history_revisions.len();
+            for _ in 0..needed {
+                let rev = self.fresh_history_revision();
+                self.history_revisions.push(rev);
+            }
+        } else if self.history_revisions.len() > self.history.len() {
+            self.history_revisions.truncate(self.history.len());
+        }
+    }
+
+    /// Bump the revision counter of a single history cell so the transcript
+    /// cache re-renders it on the next frame. Use this whenever a cell's
+    /// content (e.g. a streaming Assistant body) is mutated in place.
+    pub fn bump_history_cell(&mut self, idx: usize) {
+        // Resync first in case callers mutated `history` directly without
+        // pushing through `add_message`. After resync, the index is valid
+        // (or out of bounds — in which case there's nothing to bump).
+        self.resync_history_revisions();
+        if let Some(rev) = self.history_revisions.get_mut(idx) {
+            let new_rev = self.next_history_revision;
+            self.next_history_revision = self.next_history_revision.wrapping_add(1);
+            *rev = new_rev;
+        }
+        self.history_version = self.history_version.wrapping_add(1);
+        self.needs_redraw = true;
+    }
+
+    /// Append a single history cell, allocating a fresh per-cell revision.
+    /// Equivalent to `add_message` but exposed as a generic alias so call
+    /// sites currently doing `app.history.push(...)` followed by
+    /// `app.mark_history_updated()` can collapse to one helper.
+    pub fn push_history_cell(&mut self, cell: HistoryCell) {
+        let rev = self.fresh_history_revision();
+        self.history.push(cell);
+        self.history_revisions.push(rev);
+        self.history_version = self.history_version.wrapping_add(1);
+        self.needs_redraw = true;
+    }
+
+    /// Append a batch of history cells, allocating fresh revisions.
+    pub fn extend_history<I>(&mut self, cells: I)
+    where
+        I: IntoIterator<Item = HistoryCell>,
+    {
+        for cell in cells {
+            let rev = self.fresh_history_revision();
+            self.history.push(cell);
+            self.history_revisions.push(rev);
+        }
+        self.history_version = self.history_version.wrapping_add(1);
+        self.needs_redraw = true;
+    }
+
+    /// Clear the history and its revision tracking. Used by /clear, session
+    /// reset, and other "wipe and reload" flows.
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.history_revisions.clear();
+        self.history_version = self.history_version.wrapping_add(1);
+        self.needs_redraw = true;
+    }
+
+    /// Pop the trailing history cell, keeping revisions in sync.
+    pub fn pop_history(&mut self) -> Option<HistoryCell> {
+        let cell = self.history.pop();
+        if cell.is_some() {
+            self.history_revisions.pop();
+            self.history_version = self.history_version.wrapping_add(1);
+            self.needs_redraw = true;
+        }
+        cell
     }
 
     /// Bump the active-cell revision counter and request a redraw.
@@ -1049,6 +1163,14 @@ impl App {
     /// in-flight entry, history version otherwise).
     pub fn cell_at_virtual_index_mut(&mut self, index: usize) -> Option<&mut HistoryCell> {
         if index < self.history.len() {
+            // Bump only the targeted cell's revision; leave every other
+            // cell's cached render intact.
+            self.resync_history_revisions();
+            if let Some(rev) = self.history_revisions.get_mut(index) {
+                let new_rev = self.next_history_revision;
+                self.next_history_revision = self.next_history_revision.wrapping_add(1);
+                *rev = new_rev;
+            }
             self.history_version = self.history_version.wrapping_add(1);
             self.history.get_mut(index)
         } else {
@@ -1123,7 +1245,9 @@ impl App {
         self.exploring_entries.clear();
 
         for cell in drained {
+            let rev = self.fresh_history_revision();
             self.history.push(cell);
+            self.history_revisions.push(rev);
         }
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;

@@ -34,7 +34,7 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
 /// Clear conversation history
 pub fn clear(app: &mut App) -> CommandResult {
-    app.history.clear();
+    app.clear_history();
     app.mark_history_updated();
     app.api_messages.clear();
     app.system_prompt = None;
