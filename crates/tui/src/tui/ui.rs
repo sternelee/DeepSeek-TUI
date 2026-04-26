@@ -67,6 +67,7 @@ use crate::tui::session_picker::SessionPickerView;
 use crate::tui::ui_text::{history_cell_to_text, line_to_plain, slice_text, text_display_width};
 use crate::tui::user_input::UserInputView;
 
+use super::active_cell::ActiveCell;
 use super::app::{
     App, AppAction, AppMode, OnboardingState, QueuedMessage, SidebarFocus, StatusToastLevel,
     TaskPanelEntry, ToolDetailRecord, TuiOptions,
@@ -75,9 +76,9 @@ use super::approval::{
     ApprovalMode, ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
 };
 use super::history::{
-    DiffPreviewCell, ExecCell, ExecSource, ExploringCell, ExploringEntry, GenericToolCell,
-    HistoryCell, McpToolCell, PatchSummaryCell, PlanStep, PlanUpdateCell, ReviewCell, ToolCell,
-    ToolStatus, ViewImageCell, WebSearchCell, history_cells_from_message, summarize_mcp_output,
+    DiffPreviewCell, ExecCell, ExecSource, ExploringEntry, GenericToolCell, HistoryCell,
+    McpToolCell, PatchSummaryCell, PlanStep, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus,
+    ViewImageCell, WebSearchCell, history_cells_from_message, summarize_mcp_output,
     summarize_tool_args, summarize_tool_output,
 };
 use super::views::{ConfigView, HelpView, ModalKind, ViewEvent};
@@ -345,6 +346,12 @@ async fn run_event_loop(
                 received_engine_event = true;
                 match event {
                     EngineEvent::MessageStarted { .. } => {
+                        // Assistant text starting after parallel tool work
+                        // means the tool group is done. Flush the active
+                        // cell first so the message lands BELOW the
+                        // committed tool group (Codex pattern: streamed
+                        // assistant content always flows after work).
+                        app.flush_active_cell();
                         current_streaming_text.clear();
                         app.streaming_state.reset();
                         app.streaming_state.start_text(0, None);
@@ -354,6 +361,12 @@ async fn run_event_loop(
                         let sanitized = sanitize_stream_chunk(&content);
                         if sanitized.is_empty() {
                             continue;
+                        }
+                        // First delta of a fresh stream has no streaming
+                        // cell yet; flush active so the tool group settles
+                        // before the assistant prose appears below it.
+                        if app.streaming_message_index.is_none() {
+                            app.flush_active_cell();
                         }
                         current_streaming_text.push_str(&sanitized);
                         let index =
@@ -416,6 +429,9 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::ThinkingStarted { .. } => {
+                        // A fresh thinking block after parallel tools means
+                        // that batch is done; settle it into history.
+                        app.flush_active_cell();
                         app.reasoning_buffer.clear();
                         app.reasoning_header = None;
                         app.thinking_started_at = Some(Instant::now());
@@ -518,6 +534,19 @@ async fn run_event_loop(
                         status,
                         error,
                     } => {
+                        // Finalize any in-flight tool group. Cancellation
+                        // marks still-running entries as Failed so the user
+                        // sees they were interrupted rather than the spinner
+                        // hanging forever.
+                        if matches!(
+                            status,
+                            crate::core::events::TurnOutcomeStatus::Interrupted
+                                | crate::core::events::TurnOutcomeStatus::Failed
+                        ) {
+                            app.finalize_active_cell_as_interrupted();
+                        } else {
+                            app.flush_active_cell();
+                        }
                         app.is_loading = false;
                         app.offline_mode = false;
                         app.streaming_state.reset();
@@ -3246,6 +3275,10 @@ fn apply_loaded_session(app: &mut App, session: &SavedSession) {
     app.history.clear();
     app.tool_cells.clear();
     app.tool_details_by_cell.clear();
+    app.active_cell = None;
+    app.active_tool_details.clear();
+    app.active_cell_revision = app.active_cell_revision.wrapping_add(1);
+    app.exploring_cell = None;
     app.exploring_entries.clear();
     app.ignored_tool_calls.clear();
     app.pending_tool_uses.clear();
@@ -4461,34 +4494,44 @@ fn format_task_detail(task: &TaskRecord) -> String {
 #[allow(clippy::too_many_lines)]
 fn handle_tool_call_started(app: &mut App, id: &str, name: &str, input: &serde_json::Value) {
     let id = id.to_string();
+
+    // All in-flight tool work for the current turn lives in `app.active_cell`
+    // until the turn completes. This mirrors Codex's contract: ONE active cell
+    // mutates in place; finalized history isn't touched until flush. This
+    // keeps the transcript stable while parallel completions arrive in any
+    // order.
+    if app.active_cell.is_none() {
+        app.active_cell = Some(ActiveCell::new());
+    }
+
     if is_exploring_tool(name) {
         let label = exploring_label(name, input);
-        let cell_index = if let Some(idx) = app.exploring_cell {
-            idx
-        } else {
-            app.add_message(HistoryCell::Tool(ToolCell::Exploring(ExploringCell {
-                entries: Vec::new(),
-            })));
-            let idx = app.history.len().saturating_sub(1);
-            app.exploring_cell = Some(idx);
-            idx
-        };
-
-        if let Some(HistoryCell::Tool(ToolCell::Exploring(cell))) = app.history.get_mut(cell_index)
-        {
-            let entry_index = cell.insert_entry(ExploringEntry {
-                label,
-                status: ToolStatus::Running,
-            });
-            app.mark_history_updated();
-            app.exploring_entries
-                .insert(id.clone(), (cell_index, entry_index));
-        }
-        register_tool_cell(app, &id, name, input, cell_index);
+        // ensure_exploring + append_to_exploring keeps all parallel exploring
+        // starts in a single ExploringCell entry.
+        let active = app.active_cell.as_mut().expect("active_cell just ensured");
+        let entry_idx = active.ensure_exploring();
+        let inner = active
+            .append_to_exploring(
+                id.clone(),
+                ExploringEntry {
+                    label,
+                    status: ToolStatus::Running,
+                },
+            )
+            .map_or(0, |(_, inner)| inner);
+        app.exploring_cell = Some(entry_idx);
+        let virtual_index = app.history.len() + entry_idx;
+        app.exploring_entries
+            .insert(id.clone(), (virtual_index, inner));
+        register_tool_cell(app, &id, name, input, virtual_index);
+        app.mark_history_updated();
         return;
     }
 
-    app.exploring_cell = None;
+    // Non-exploring tool: each is its own entry inside the active cell. We
+    // intentionally do NOT clear `exploring_cell` here — the active cell can
+    // hold both an exploring aggregate AND independent tool entries
+    // simultaneously, which is exactly the case CX#7 fixes.
 
     if is_exec_tool(name) {
         let command = exec_command_from_input(input).unwrap_or_else(|| "<command>".to_string());
@@ -4511,17 +4554,21 @@ fn handle_tool_call_started(app: &mut App, id: &str, name: &str, input: &serde_j
                 app.last_exec_wait_command = Some(command.clone());
             }
 
-            app.add_message(HistoryCell::Tool(ToolCell::Exec(ExecCell {
-                command,
-                status: ToolStatus::Running,
-                output: None,
-                started_at: Some(Instant::now()),
-                duration_ms: None,
-                source,
-                interaction: Some(summary.clone()),
-            })));
-            let cell_index = app.history.len().saturating_sub(1);
-            register_tool_cell(app, &id, name, input, cell_index);
+            push_active_tool_cell(
+                app,
+                &id,
+                name,
+                input,
+                HistoryCell::Tool(ToolCell::Exec(ExecCell {
+                    command,
+                    status: ToolStatus::Running,
+                    output: None,
+                    started_at: Some(Instant::now()),
+                    duration_ms: None,
+                    source,
+                    interaction: Some(summary.clone()),
+                })),
+            );
             return;
         }
 
@@ -4538,69 +4585,87 @@ fn handle_tool_call_started(app: &mut App, id: &str, name: &str, input: &serde_j
             app.last_exec_wait_command = Some(command.clone());
         }
 
-        app.add_message(HistoryCell::Tool(ToolCell::Exec(ExecCell {
-            command,
-            status: ToolStatus::Running,
-            output: None,
-            started_at: Some(Instant::now()),
-            duration_ms: None,
-            source,
-            interaction: None,
-        })));
-        let cell_index = app.history.len().saturating_sub(1);
-        register_tool_cell(app, &id, name, input, cell_index);
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::Exec(ExecCell {
+                command,
+                status: ToolStatus::Running,
+                output: None,
+                started_at: Some(Instant::now()),
+                duration_ms: None,
+                source,
+                interaction: None,
+            })),
+        );
         return;
     }
 
     if name == "update_plan" {
         let (explanation, steps) = parse_plan_input(input);
-        app.add_message(HistoryCell::Tool(ToolCell::PlanUpdate(PlanUpdateCell {
-            explanation,
-            steps,
-            status: ToolStatus::Running,
-        })));
-        let cell_index = app.history.len().saturating_sub(1);
-        register_tool_cell(app, &id, name, input, cell_index);
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::PlanUpdate(PlanUpdateCell {
+                explanation,
+                steps,
+                status: ToolStatus::Running,
+            })),
+        );
         return;
     }
 
     if name == "apply_patch" {
         let (path, summary) = parse_patch_summary(input);
-        app.add_message(HistoryCell::Tool(ToolCell::PatchSummary(
-            PatchSummaryCell {
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::PatchSummary(PatchSummaryCell {
                 path,
                 summary,
                 status: ToolStatus::Running,
                 error: None,
-            },
-        )));
-        let cell_index = app.history.len().saturating_sub(1);
-        register_tool_cell(app, &id, name, input, cell_index);
+            })),
+        );
         return;
     }
 
     if name == "review" {
         let target = review_target_label(input);
-        app.add_message(HistoryCell::Tool(ToolCell::Review(ReviewCell {
-            target,
-            status: ToolStatus::Running,
-            output: None,
-            error: None,
-        })));
-        let cell_index = app.history.len().saturating_sub(1);
-        register_tool_cell(app, &id, name, input, cell_index);
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::Review(ReviewCell {
+                target,
+                status: ToolStatus::Running,
+                output: None,
+                error: None,
+            })),
+        );
         return;
     }
 
     if is_mcp_tool(name) {
-        app.add_message(HistoryCell::Tool(ToolCell::Mcp(McpToolCell {
-            tool: name.to_string(),
-            status: ToolStatus::Running,
-            content: None,
-            is_image: false,
-        })));
-        let cell_index = app.history.len().saturating_sub(1);
-        register_tool_cell(app, &id, name, input, cell_index);
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::Mcp(McpToolCell {
+                tool: name.to_string(),
+                status: ToolStatus::Running,
+                content: None,
+                is_image: false,
+            })),
+        );
         return;
     }
 
@@ -4611,36 +4676,65 @@ fn handle_tool_call_started(app: &mut App, id: &str, name: &str, input: &serde_j
                 .strip_prefix(&app.workspace)
                 .unwrap_or(&raw_path)
                 .to_path_buf();
-            app.add_message(HistoryCell::Tool(ToolCell::ViewImage(ViewImageCell {
-                path: display_path,
-            })));
-            let cell_index = app.history.len().saturating_sub(1);
-            register_tool_cell(app, &id, name, input, cell_index);
+            push_active_tool_cell(
+                app,
+                &id,
+                name,
+                input,
+                HistoryCell::Tool(ToolCell::ViewImage(ViewImageCell { path: display_path })),
+            );
         }
         return;
     }
 
     if is_web_search_tool(name) {
         let query = web_search_query(input);
-        app.add_message(HistoryCell::Tool(ToolCell::WebSearch(WebSearchCell {
-            query,
-            status: ToolStatus::Running,
-            summary: None,
-        })));
-        let cell_index = app.history.len().saturating_sub(1);
-        register_tool_cell(app, &id, name, input, cell_index);
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::WebSearch(WebSearchCell {
+                query,
+                status: ToolStatus::Running,
+                summary: None,
+            })),
+        );
         return;
     }
 
     let input_summary = summarize_tool_args(input);
-    app.add_message(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-        name: name.to_string(),
-        status: ToolStatus::Running,
-        input_summary,
-        output: None,
-    })));
-    let cell_index = app.history.len().saturating_sub(1);
-    register_tool_cell(app, &id, name, input, cell_index);
+    push_active_tool_cell(
+        app,
+        &id,
+        name,
+        input,
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: name.to_string(),
+            status: ToolStatus::Running,
+            input_summary,
+            output: None,
+        })),
+    );
+}
+
+/// Push a tool cell as a new entry in `active_cell`, register the tool id,
+/// and write a stub detail record so the pager / Ctrl+O can find it.
+fn push_active_tool_cell(
+    app: &mut App,
+    tool_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+    cell: HistoryCell,
+) {
+    if app.active_cell.is_none() {
+        app.active_cell = Some(ActiveCell::new());
+    }
+    let active = app.active_cell.as_mut().expect("active_cell just ensured");
+    let entry_idx = active.push_tool(tool_id.to_string(), cell);
+    let virtual_index = app.history.len() + entry_idx;
+    register_tool_cell(app, tool_id, tool_name, input, virtual_index);
+    app.mark_history_updated();
 }
 
 fn register_tool_cell(
@@ -4651,27 +4745,43 @@ fn register_tool_cell(
     cell_index: usize,
 ) {
     app.tool_cells.insert(tool_id.to_string(), cell_index);
-    app.tool_details_by_cell.insert(
-        cell_index,
-        ToolDetailRecord {
-            tool_id: tool_id.to_string(),
-            tool_name: tool_name.to_string(),
-            input: input.clone(),
-            output: None,
-        },
-    );
+    let record = ToolDetailRecord {
+        tool_id: tool_id.to_string(),
+        tool_name: tool_name.to_string(),
+        input: input.clone(),
+        output: None,
+    };
+    if cell_index < app.history.len() {
+        app.tool_details_by_cell.insert(cell_index, record);
+    } else {
+        // Active-cell entry: keep the detail record in `active_tool_details`
+        // until the active cell flushes. `flush_active_cell` migrates these
+        // records into `tool_details_by_cell` keyed by the eventual real
+        // cell index.
+        app.active_tool_details.insert(tool_id.to_string(), record);
+    }
 }
 
 fn store_tool_detail_output(
     app: &mut App,
+    tool_id: &str,
     cell_index: usize,
     result: &Result<ToolResult, ToolError>,
 ) {
-    if let Some(detail) = app.tool_details_by_cell.get_mut(&cell_index) {
-        detail.output = Some(match result {
-            Ok(tool_result) => tool_result.content.clone(),
-            Err(err) => err.to_string(),
-        });
+    let payload = Some(match result {
+        Ok(tool_result) => tool_result.content.clone(),
+        Err(err) => err.to_string(),
+    });
+    if cell_index < app.history.len()
+        && let Some(detail) = app.tool_details_by_cell.get_mut(&cell_index)
+    {
+        detail.output = payload.clone();
+    }
+    // Also write to the active table while the entry might still live there;
+    // some callsites pre-rewrite cell_index but the active_tool_details map is
+    // the canonical source for in-flight outputs.
+    if let Some(detail) = app.active_tool_details.get_mut(tool_id) {
+        detail.output = payload;
     }
 }
 
@@ -4679,18 +4789,20 @@ fn store_tool_detail_output(
 fn handle_tool_call_complete(
     app: &mut App,
     id: &str,
-    _name: &str,
+    name: &str,
     result: &Result<ToolResult, ToolError>,
 ) {
     if app.ignored_tool_calls.remove(id) {
         return;
     }
 
+    // Exploring entries land in the per-tool map regardless of whether they
+    // live in the active cell or in finalized history; the path is the same.
     if let Some((cell_index, entry_index)) = app.exploring_entries.remove(id) {
         app.tool_cells.remove(id);
-        store_tool_detail_output(app, cell_index, result);
-
-        if let Some(HistoryCell::Tool(ToolCell::Exploring(cell))) = app.history.get_mut(cell_index)
+        store_tool_detail_output(app, id, cell_index, result);
+        if let Some(HistoryCell::Tool(ToolCell::Exploring(cell))) =
+            app.cell_at_virtual_index_mut(cell_index)
             && let Some(entry) = cell.entries.get_mut(entry_index)
         {
             entry.status = match result.as_ref() {
@@ -4698,15 +4810,31 @@ fn handle_tool_call_complete(
                 Ok(_) | Err(_) => ToolStatus::Failed,
             };
             app.mark_history_updated();
+            // Mutating the in-flight exploring cell needs an active-cell
+            // revision bump so the transcript cache invalidates the synthetic
+            // tail row.
+            if cell_index >= app.history.len() {
+                app.active_cell_revision = app.active_cell_revision.wrapping_add(1);
+                if let Some(active) = app.active_cell.as_mut() {
+                    active.bump_revision();
+                }
+            }
         }
         return;
     }
 
+    // Look up the cell by tool id. If the id isn't registered, that's an
+    // orphan completion (race condition where the started event was lost or
+    // a tool result arrived after the active cell was already flushed). Build
+    // a finalized standalone cell from the result so the user can still see
+    // the output, but DO NOT touch the active cell.
     let Some(cell_index) = app.tool_cells.remove(id) else {
+        push_orphan_tool_completion(app, id, name, result);
         return;
     };
 
-    store_tool_detail_output(app, cell_index, result);
+    store_tool_detail_output(app, id, cell_index, result);
+    let in_active = cell_index >= app.history.len();
 
     let status = match result.as_ref() {
         Ok(tool_result) => match tool_result.metadata.as_ref() {
@@ -4729,7 +4857,7 @@ fn handle_tool_call_complete(
         Err(_) => ToolStatus::Failed,
     };
 
-    if let Some(cell) = app.history.get_mut(cell_index) {
+    if let Some(cell) = app.cell_at_virtual_index_mut(cell_index) {
         match cell {
             HistoryCell::Tool(ToolCell::Exec(exec)) => {
                 exec.status = status;
@@ -4830,6 +4958,95 @@ fn handle_tool_call_complete(
                 app.mark_history_updated();
             }
             _ => {}
+        }
+    }
+
+    // If the mutated cell lived inside the active group, bump the active-cell
+    // revision so the transcript cache re-renders the synthetic tail row.
+    if in_active {
+        app.active_cell_revision = app.active_cell_revision.wrapping_add(1);
+        if let Some(active) = app.active_cell.as_mut() {
+            active.bump_revision();
+        }
+    }
+}
+
+/// Build a finalized standalone history cell for a tool completion whose
+/// start was never registered (orphan). This preserves the contract that
+/// every tool result is visible somewhere; the alternative (silently
+/// dropping it) hides errors and breaks debuggability.
+///
+/// Choice of cell type: we use `GenericToolCell` because we have no input
+/// payload to reconstruct a more specific cell. The pager remains usable —
+/// `tool_details_by_cell` is populated with the result text.
+///
+/// ## Index drift
+///
+/// If an active cell is in flight when the orphan arrives, pushing the
+/// orphan into `app.history` shifts every active-cell virtual index forward
+/// by 1. We must rewrite `tool_cells` / `exploring_entries` accordingly so
+/// later completion lookups still find the right entries.
+fn push_orphan_tool_completion(
+    app: &mut App,
+    tool_id: &str,
+    name: &str,
+    result: &Result<ToolResult, ToolError>,
+) {
+    let status = match result.as_ref() {
+        Ok(tool_result) => {
+            if tool_result.success {
+                ToolStatus::Success
+            } else {
+                ToolStatus::Failed
+            }
+        }
+        Err(_) => ToolStatus::Failed,
+    };
+    let output = match result.as_ref() {
+        Ok(tool_result) => Some(summarize_tool_output(&tool_result.content)),
+        Err(err) => Some(err.to_string()),
+    };
+    let history_threshold_before_push = app.history.len();
+    let active_in_flight = app.active_cell.is_some();
+    app.add_message(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: name.to_string(),
+        status,
+        input_summary: None,
+        output,
+    })));
+    let cell_index = app.history.len().saturating_sub(1);
+    app.tool_details_by_cell.insert(
+        cell_index,
+        ToolDetailRecord {
+            tool_id: tool_id.to_string(),
+            tool_name: name.to_string(),
+            input: serde_json::Value::Null,
+            output: match result.as_ref() {
+                Ok(tool_result) => Some(tool_result.content.clone()),
+                Err(err) => Some(err.to_string()),
+            },
+        },
+    );
+
+    // Shift active-cell virtual indices forward by 1 to absorb the new
+    // history cell. Without this, the next completion would address the
+    // wrong entry.
+    if active_in_flight {
+        let threshold = history_threshold_before_push;
+        for idx in app.tool_cells.values_mut() {
+            if *idx >= threshold {
+                *idx = idx.wrapping_add(1);
+            }
+        }
+        for (cell_idx, _) in app.exploring_entries.values_mut() {
+            if *cell_idx >= threshold {
+                *cell_idx = cell_idx.wrapping_add(1);
+            }
+        }
+        if let Some(idx) = app.exploring_cell.as_mut()
+            && *idx >= threshold
+        {
+            *idx = idx.wrapping_add(1);
         }
     }
 }

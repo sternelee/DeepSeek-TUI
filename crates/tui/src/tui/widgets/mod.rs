@@ -69,9 +69,33 @@ impl ChatWidget {
         // we synthesize a uniform slice from the global history_version so
         // any mutation invalidates every cell (matches the pre-cache
         // semantics).
-        let cell_revisions = vec![app.history_version; app.history.len()];
+        //
+        // The active in-flight cell (if any) is appended as the last cell so
+        // its mutations show up at the live tail. Each entry inside the
+        // active cell becomes a virtual cell at index `history.len() + i`,
+        // matching `App::cell_at_virtual_index`. Active-cell entries get a
+        // distinct revision derived from `active_cell_revision` so changes to
+        // them only re-render those rows.
+        let active_entries: &[HistoryCell] = app
+            .active_cell
+            .as_ref()
+            .map_or(&[], |active| active.entries());
+        let mut combined_cells: Vec<HistoryCell> =
+            Vec::with_capacity(app.history.len() + active_entries.len());
+        combined_cells.extend_from_slice(&app.history);
+        combined_cells.extend_from_slice(active_entries);
+        let mut cell_revisions = vec![app.history_version; combined_cells.len()];
+        // Salt the active-cell revisions with `active_cell_revision` so they
+        // invalidate independently of the history version when only the
+        // active cell mutates.
+        if !active_entries.is_empty() {
+            let active_rev = app.active_cell_revision;
+            for rev in cell_revisions.iter_mut().skip(app.history.len()) {
+                *rev = rev.wrapping_add(active_rev.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            }
+        }
         app.transcript_cache.ensure(
-            &app.history,
+            &combined_cells,
             &cell_revisions,
             content_area.width.max(1),
             render_options,

@@ -21,6 +21,7 @@ use crate::settings::Settings;
 use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
 use crate::tools::subagent::SubAgentResult;
 use crate::tools::todo::{SharedTodoList, new_shared_todo_list};
+use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
@@ -414,6 +415,10 @@ pub struct App {
     pub slash_menu_selected: usize,
     /// Temporary hide flag for slash menu until next input edit.
     pub slash_menu_hidden: bool,
+    /// `@`-mention completion popup selection index in composer.
+    pub mention_menu_selected: usize,
+    /// Temporary hide flag for the @-mention popup until next input edit.
+    pub mention_menu_hidden: bool,
     #[allow(dead_code)]
     pub compact_threshold: usize,
     pub max_input_history: usize,
@@ -468,13 +473,31 @@ pub struct App {
     pub session_cost: f64,
     /// Active skill to apply to next user message
     pub active_skill: Option<String>,
-    /// Tool call cells by tool id
+    /// Tool call cells by tool id (for cells already finalized in `history`).
+    /// While a tool call is in flight inside `active_cell`, it is tracked by
+    /// `active_tool_entries` instead and migrated here at flush time.
     pub tool_cells: HashMap<String, usize>,
     /// Full tool input/output keyed by history cell index.
     pub tool_details_by_cell: HashMap<usize, ToolDetailRecord>,
-    /// Active exploring cell index
+    /// In-flight tool/exec group for the current turn. Mutated in place as
+    /// parallel tool calls start and complete; flushed into `history` on
+    /// `TurnComplete`.
+    pub active_cell: Option<ActiveCell>,
+    /// Revision counter for `active_cell`. Combined with `active_cell.revision`
+    /// when feeding the transcript cache so cached lines for the synthetic
+    /// active-cell row are invalidated on every mutation.
+    pub active_cell_revision: u64,
+    /// Pending tool details for entries that live inside `active_cell`.
+    /// Keyed by tool id rather than cell index because the active cell's
+    /// virtual index can shift (orphan completions push real cells in
+    /// between). Migrated into `tool_details_by_cell` on flush.
+    pub active_tool_details: HashMap<String, ToolDetailRecord>,
+    /// Active exploring cell entry index (within `active_cell.entries`).
+    /// `None` once the active cell flushes or no exploring entry exists.
     pub exploring_cell: Option<usize>,
-    /// Mapping of exploring tool ids to (cell index, entry index)
+    /// Mapping of exploring tool ids to `(entry index in active_cell, entry
+    /// within ExploringCell)`. Used to update individual exploring entries
+    /// when their tools complete.
     pub exploring_entries: HashMap<String, (usize, usize)>,
     /// Tool calls that should be ignored by the UI
     pub ignored_tool_calls: HashSet<String>,
@@ -726,6 +749,8 @@ impl App {
             sidebar_width_percent,
             sidebar_focus,
             slash_menu_selected: 0,
+            mention_menu_selected: 0,
+            mention_menu_hidden: false,
             slash_menu_hidden: false,
             compact_threshold,
             max_input_history,
@@ -772,6 +797,9 @@ impl App {
             active_skill: None,
             tool_cells: HashMap::new(),
             tool_details_by_cell: HashMap::new(),
+            active_cell: None,
+            active_cell_revision: 0,
+            active_tool_details: HashMap::new(),
             exploring_cell: None,
             exploring_entries: HashMap::new(),
             ignored_tool_calls: HashSet::new(),
@@ -947,6 +975,144 @@ impl App {
     pub fn mark_history_updated(&mut self) {
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
+    }
+
+    /// Bump the active-cell revision counter and request a redraw.
+    ///
+    /// Use this whenever an entry inside `active_cell` is mutated. The
+    /// transcript cache combines this counter with `history_version` to
+    /// produce a per-cell revision so the synthetic active-cell row can be
+    /// re-rendered without invalidating committed history cells.
+    pub fn bump_active_cell_revision(&mut self) {
+        self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+        if let Some(active) = self.active_cell.as_mut() {
+            active.bump_revision();
+        }
+        self.history_version = self.history_version.wrapping_add(1);
+        self.needs_redraw = true;
+    }
+
+    /// Total number of cells in the *virtual* transcript: `history.len()`
+    /// plus active cell entries (if any).
+    #[must_use]
+    #[allow(dead_code)] // Reserved for renderers that need a unified cell count.
+    pub fn virtual_cell_count(&self) -> usize {
+        self.history.len() + self.active_cell.as_ref().map_or(0, ActiveCell::entry_count)
+    }
+
+    /// The next cell index a freshly-pushed entry would occupy in the virtual
+    /// transcript. Used by `register_tool_cell`-style callsites that record
+    /// cell-index metadata before the active cell flushes to history.
+    #[must_use]
+    #[allow(dead_code)] // Reserved for the eventual merged push helper.
+    pub fn next_virtual_cell_index(&self) -> usize {
+        self.virtual_cell_count()
+    }
+
+    /// Resolve a virtual cell index to either a committed history cell or an
+    /// active-cell entry. Used by the pager / details lookup code so it can
+    /// transparently address still-in-flight cells.
+    #[must_use]
+    #[allow(dead_code)] // Used by the upcoming pager rewrite (read-only resolver).
+    pub fn cell_at_virtual_index(&self, index: usize) -> Option<&HistoryCell> {
+        if index < self.history.len() {
+            self.history.get(index)
+        } else {
+            let entry_idx = index - self.history.len();
+            self.active_cell
+                .as_ref()
+                .and_then(|active| active.entries().get(entry_idx))
+        }
+    }
+
+    /// Mutable variant of [`Self::cell_at_virtual_index`]. Bumps the
+    /// appropriate revision counter (active-cell revision when targeting an
+    /// in-flight entry, history version otherwise).
+    pub fn cell_at_virtual_index_mut(&mut self, index: usize) -> Option<&mut HistoryCell> {
+        if index < self.history.len() {
+            self.history_version = self.history_version.wrapping_add(1);
+            self.history.get_mut(index)
+        } else {
+            let entry_idx = index - self.history.len();
+            self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+            self.history_version = self.history_version.wrapping_add(1);
+            self.active_cell
+                .as_mut()
+                .and_then(|active| active.entry_mut(entry_idx))
+        }
+    }
+
+    /// Drain the active cell into history. Companion maps that reference
+    /// active-cell entries by virtual index (`tool_cells`,
+    /// `tool_details_by_cell`) are rewritten to point at the new history
+    /// indices. Idempotent — calling this when there is no active cell is a
+    /// no-op.
+    ///
+    /// Caller is responsible for first marking in-progress entries with the
+    /// terminal status they want (e.g. via
+    /// [`ActiveCell::mark_in_progress_as_interrupted`]).
+    pub fn flush_active_cell(&mut self) {
+        let Some(mut active) = self.active_cell.take() else {
+            return;
+        };
+        if active.is_empty() {
+            // Reset auxiliary state regardless so a future tool can start a
+            // fresh active cell.
+            self.exploring_cell = None;
+            self.exploring_entries.clear();
+            self.active_tool_details.clear();
+            self.bump_active_cell_revision();
+            return;
+        }
+
+        let drained = active.drain();
+        let base_index = self.history.len();
+
+        // Rewrite per-tool indices that targeted entries inside the active
+        // group: their new home is `base_index + entry_offset`.
+        let mut details = std::mem::take(&mut self.active_tool_details);
+        for (tool_id, detail) in details.drain() {
+            // Try to recover the entry offset from `tool_cells`-style maps.
+            // Tool ids registered for active-cell entries live in
+            // `tool_cells` with `index = base_index_at_register_time +
+            // entry_offset`. After rewriting once, those indices are correct.
+            self.tool_details_by_cell
+                .entry(self.tool_cells.get(&tool_id).copied().unwrap_or(base_index))
+                .or_insert(detail);
+        }
+
+        // tool_cells already contains the virtual index. After the drain,
+        // history.len() == base_index + drained.len(), so any virtual index
+        // in [base_index, base_index + drained.len()) is now a real history
+        // index. No rewrite needed.
+        self.exploring_cell = None;
+        self.exploring_entries.clear();
+
+        for cell in drained {
+            self.history.push(cell);
+        }
+        self.history_version = self.history_version.wrapping_add(1);
+        self.needs_redraw = true;
+        let selection_has_range = self
+            .transcript_selection
+            .ordered_endpoints()
+            .is_some_and(|(start, end)| start != end);
+        if self.transcript_scroll.is_at_tail()
+            && !self.transcript_selection.dragging
+            && !selection_has_range
+            && !self.user_scrolled_during_stream
+        {
+            self.scroll_to_bottom();
+        }
+    }
+
+    /// Mark every still-running entry in the active cell as interrupted, then
+    /// flush. Convenience helper for cancellation paths.
+    pub fn finalize_active_cell_as_interrupted(&mut self) {
+        if let Some(active) = self.active_cell.as_mut() {
+            active.mark_in_progress_as_interrupted();
+        }
+        self.flush_active_cell();
     }
 
     pub fn push_status_toast(
@@ -1139,6 +1305,8 @@ impl App {
         self.input.insert_str(byte_index, text);
         self.cursor_position = cursor + char_count(text);
         self.slash_menu_hidden = false;
+        self.mention_menu_hidden = false;
+        self.mention_menu_selected = 0;
         self.needs_redraw = true;
     }
 
@@ -1273,6 +1441,8 @@ impl App {
         self.input.insert(byte_index, c);
         self.cursor_position = cursor + 1;
         self.slash_menu_hidden = false;
+        self.mention_menu_hidden = false;
+        self.mention_menu_selected = 0;
         self.needs_redraw = true;
     }
 
@@ -1285,6 +1455,8 @@ impl App {
         if removed {
             self.cursor_position = target;
             self.slash_menu_hidden = false;
+            self.mention_menu_hidden = false;
+            self.mention_menu_selected = 0;
             self.needs_redraw = true;
         }
     }
@@ -1299,6 +1471,8 @@ impl App {
             self.cursor_position = char_count(&self.input);
         }
         self.slash_menu_hidden = false;
+        self.mention_menu_hidden = false;
+        self.mention_menu_selected = 0;
         self.needs_redraw = true;
     }
 
@@ -1341,6 +1515,8 @@ impl App {
         // Cursor stays at the same character index (start of removed range).
         self.cursor_position = cursor;
         self.slash_menu_hidden = false;
+        self.mention_menu_hidden = false;
+        self.mention_menu_selected = 0;
         self.needs_redraw = true;
         true
     }
@@ -1358,6 +1534,8 @@ impl App {
         self.input.insert_str(byte_index, &text);
         self.cursor_position = cursor + char_count(&text);
         self.slash_menu_hidden = false;
+        self.mention_menu_hidden = false;
+        self.mention_menu_selected = 0;
         self.needs_redraw = true;
         true
     }

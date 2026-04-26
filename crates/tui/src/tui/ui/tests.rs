@@ -4,7 +4,7 @@ use crate::tui::file_mention::{
     find_file_mention_completions, partial_file_mention_at_cursor, try_autocomplete_file_mention,
     user_request_with_file_mentions,
 };
-use crate::tui::history::{GenericToolCell, ToolCell, ToolStatus};
+use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
 use crate::tui::views::{ModalView, ViewAction};
 use std::path::PathBuf;
 use std::process::Command;
@@ -1055,4 +1055,304 @@ fn try_autocomplete_file_mention_returns_false_outside_mention() {
     app.input = "no mention here".to_string();
     app.cursor_position = app.input.chars().count();
     assert!(!try_autocomplete_file_mention(&mut app));
+}
+
+// === CX#7 — single active cell mutated in place for parallel tool calls ===
+
+/// Build a minimal successful ToolResult with the given content.
+fn ok_result(
+    content: &str,
+) -> Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError> {
+    Ok(crate::tools::spec::ToolResult::success(content))
+}
+
+#[test]
+fn parallel_exploring_tool_starts_share_one_active_entry() {
+    // Three exploring tools start in any order; they must collapse into one
+    // entry inside the active cell rather than three separate cells. This is
+    // the central CX#7 contract for the most common parallel case.
+    let mut app = create_test_app();
+
+    handle_tool_call_started(
+        &mut app,
+        "t-a",
+        "read_file",
+        &serde_json::json!({"path": "alpha.rs"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "t-b",
+        "read_file",
+        &serde_json::json!({"path": "beta.rs"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "t-c",
+        "grep_files",
+        &serde_json::json!({"pattern": "TODO"}),
+    );
+
+    // History must remain empty: nothing flushes until the turn ends.
+    assert_eq!(app.history.len(), 0, "no history cells written mid-turn");
+    let active = app.active_cell.as_ref().expect("active cell created");
+    assert_eq!(
+        active.entry_count(),
+        1,
+        "all exploring starts share one entry"
+    );
+    let HistoryCell::Tool(ToolCell::Exploring(explore)) = &active.entries()[0] else {
+        panic!("expected exploring cell")
+    };
+    assert_eq!(explore.entries.len(), 3);
+    for entry in &explore.entries {
+        assert_eq!(entry.status, ToolStatus::Running);
+    }
+}
+
+#[test]
+fn out_of_order_completes_finalize_one_history_cell_per_turn() {
+    // Three parallel tools complete in reverse order; we then signal turn
+    // complete and assert exactly one tool history cell exists (the
+    // finalized active group). This proves the active cell didn't bounce
+    // mid-turn and that the flush path correctly migrates entries.
+    let mut app = create_test_app();
+
+    handle_tool_call_started(
+        &mut app,
+        "t-1",
+        "read_file",
+        &serde_json::json!({"path": "a.rs"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "t-2",
+        "read_file",
+        &serde_json::json!({"path": "b.rs"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "t-3",
+        "grep_files",
+        &serde_json::json!({"pattern": "x"}),
+    );
+
+    // Out-of-order completion: t-3, then t-1, then t-2.
+    handle_tool_call_complete(&mut app, "t-3", "grep_files", &ok_result("two hits"));
+    handle_tool_call_complete(&mut app, "t-1", "read_file", &ok_result("contents A"));
+    handle_tool_call_complete(&mut app, "t-2", "read_file", &ok_result("contents B"));
+
+    // Still nothing in history: the active cell holds everything.
+    assert_eq!(app.history.len(), 0);
+    let active = app.active_cell.as_ref().expect("active cell still present");
+    let HistoryCell::Tool(ToolCell::Exploring(explore)) = &active.entries()[0] else {
+        panic!("expected exploring cell")
+    };
+    assert!(
+        explore
+            .entries
+            .iter()
+            .all(|e| e.status == ToolStatus::Success),
+        "all exploring entries should be Success after their tools complete"
+    );
+
+    // Flush via the explicit helper (mirrors what TurnComplete does).
+    app.flush_active_cell();
+
+    assert!(app.active_cell.is_none(), "active cell cleared after flush");
+    // The flushed group is exactly one history cell — the merged exploring
+    // aggregate. This is the heart of CX#7: parallel work renders as ONE
+    // finalized cell, regardless of completion order.
+    let tool_cells = app
+        .history
+        .iter()
+        .filter(|c| matches!(c, HistoryCell::Tool(_)))
+        .count();
+    assert_eq!(
+        tool_cells, 1,
+        "exactly one tool history cell after parallel turn"
+    );
+}
+
+#[test]
+fn mixed_parallel_tools_render_in_single_active_cell() {
+    // Tools of different shapes — exploring + exec + generic — all in flight
+    // at once. The active cell must hold them all without bouncing.
+    let mut app = create_test_app();
+
+    handle_tool_call_started(
+        &mut app,
+        "ex-1",
+        "read_file",
+        &serde_json::json!({"path": "x.rs"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "shell-1",
+        "exec_shell",
+        &serde_json::json!({"command": "ls"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "gen-1",
+        "todo_write",
+        &serde_json::json!({"items": []}),
+    );
+
+    assert_eq!(app.history.len(), 0);
+    let active = app.active_cell.as_ref().expect("active cell present");
+    // 3 entries: exploring aggregate (1) + exec + generic.
+    assert_eq!(active.entry_count(), 3);
+
+    handle_tool_call_complete(&mut app, "shell-1", "exec_shell", &ok_result("ok"));
+    handle_tool_call_complete(&mut app, "gen-1", "todo_write", &ok_result("done"));
+    handle_tool_call_complete(&mut app, "ex-1", "read_file", &ok_result("file body"));
+
+    // After all complete, still in active until flush.
+    assert_eq!(app.history.len(), 0);
+    app.flush_active_cell();
+    let tool_cells: Vec<_> = app
+        .history
+        .iter()
+        .filter(|c| matches!(c, HistoryCell::Tool(_)))
+        .collect();
+    assert_eq!(
+        tool_cells.len(),
+        3,
+        "three distinct tool shapes finalize as three cells in stable insertion order"
+    );
+}
+
+#[test]
+fn orphan_tool_complete_with_unknown_id_pushes_separate_cell() {
+    // A ToolCallComplete with no matching ToolCallStarted — the orphan path.
+    // Per the design we render it as a finalized standalone cell so the user
+    // still sees the output, but we must NOT flush or contaminate any active
+    // cell that's currently in flight.
+    let mut app = create_test_app();
+
+    handle_tool_call_started(
+        &mut app,
+        "live-1",
+        "read_file",
+        &serde_json::json!({"path": "live.rs"}),
+    );
+
+    // Orphan completion arrives.
+    handle_tool_call_complete(&mut app, "ghost-id", "mystery_tool", &ok_result("oops"));
+
+    // Active cell is intact.
+    let active = app
+        .active_cell
+        .as_ref()
+        .expect("active cell preserved after orphan");
+    assert_eq!(active.entry_count(), 1);
+
+    // The orphan rendered as a separate finalized cell pushed to history.
+    assert_eq!(app.history.len(), 1, "orphan added one finalized cell");
+    let HistoryCell::Tool(ToolCell::Generic(generic)) = &app.history[0] else {
+        panic!("orphan should render as a Generic tool cell")
+    };
+    assert_eq!(generic.name, "mystery_tool");
+    assert_eq!(generic.status, ToolStatus::Success);
+}
+
+#[test]
+fn turn_complete_flushes_active_cell_into_history() {
+    // The full path through the public flush helper. Verifies that a
+    // mid-turn snapshot (exec running, exploring complete) becomes a stable
+    // history slice on flush.
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "ex-1",
+        "read_file",
+        &serde_json::json!({"path": "a.rs"}),
+    );
+    handle_tool_call_complete(&mut app, "ex-1", "read_file", &ok_result("body"));
+    handle_tool_call_started(
+        &mut app,
+        "shell-1",
+        "exec_shell",
+        &serde_json::json!({"command": "ls"}),
+    );
+    // Don't complete shell-1 — simulate cancellation mid-shell.
+    app.finalize_active_cell_as_interrupted();
+
+    assert!(app.active_cell.is_none(), "active cell cleared on flush");
+    let exec_cells: Vec<_> = app
+        .history
+        .iter()
+        .filter_map(|c| match c {
+            HistoryCell::Tool(ToolCell::Exec(exec)) => Some(exec),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exec_cells.len(), 1);
+    assert_eq!(
+        exec_cells[0].status,
+        ToolStatus::Failed,
+        "interrupted shell entry marked Failed (closest available terminal status)"
+    );
+}
+
+#[test]
+fn orphan_during_active_keeps_subsequent_completion_routed_correctly() {
+    // Regression cover for the index-shift trap: when an orphan arrives
+    // mid-active, it pushes a real history cell that bumps virtual indices
+    // by one. A subsequent legitimate completion must still find its entry.
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "live",
+        "exec_shell",
+        &serde_json::json!({"command": "ls"}),
+    );
+    // Orphan completion arrives FIRST (before live's completion).
+    handle_tool_call_complete(&mut app, "ghost", "weird_tool", &ok_result("ghost-out"));
+    // Now complete the live tool — it should still mutate the active entry,
+    // not silently drop or hit a stale index.
+    handle_tool_call_complete(&mut app, "live", "exec_shell", &ok_result("hello"));
+
+    // Active cell still present (turn hasn't completed).
+    let active = app.active_cell.as_ref().expect("active cell present");
+    let HistoryCell::Tool(ToolCell::Exec(exec)) = &active.entries()[0] else {
+        panic!("expected exec cell")
+    };
+    assert_eq!(exec.status, ToolStatus::Success);
+
+    // History contains exactly the orphan.
+    assert_eq!(app.history.len(), 1);
+    let HistoryCell::Tool(ToolCell::Generic(generic)) = &app.history[0] else {
+        panic!("expected orphan generic cell")
+    };
+    assert_eq!(generic.name, "weird_tool");
+
+    // Flush settles the active exec into history below the orphan.
+    app.flush_active_cell();
+    assert_eq!(app.history.len(), 2);
+}
+
+#[test]
+fn tool_details_survive_active_cell_flush() {
+    // The pager / Ctrl+O resolves tool details by cell index. Flushing the
+    // active cell must move detail records into `tool_details_by_cell` so
+    // the pager keeps working after the turn settles.
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "tid",
+        "exec_shell",
+        &serde_json::json!({"command": "echo hi"}),
+    );
+    handle_tool_call_complete(&mut app, "tid", "exec_shell", &ok_result("hi"));
+    app.flush_active_cell();
+
+    // The exec cell is now at index 0 in history.
+    assert_eq!(app.history.len(), 1);
+    let detail = app
+        .tool_details_by_cell
+        .get(&0)
+        .expect("detail record migrated to flushed cell index");
+    assert_eq!(detail.tool_id, "tid");
+    assert_eq!(detail.tool_name, "exec_shell");
 }

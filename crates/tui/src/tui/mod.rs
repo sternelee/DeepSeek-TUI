@@ -2,6 +2,7 @@
 
 // === Submodules ===
 
+pub mod active_cell;
 pub mod app;
 pub mod approval;
 pub mod clipboard;
