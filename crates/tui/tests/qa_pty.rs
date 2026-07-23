@@ -1045,13 +1045,14 @@ fn work_surface_real_rows_own_click_wheel_and_resize() -> anyhow::Result<()> {
         .find_text("todo-mouse-00")
         .expect("real rendered first To-do row");
 
-    // The default top Work surface is three rows tall: two content rows plus
-    // its visible divider. Send genuine SGR down/drag/up bytes and prove the
-    // resized surface exposes additional real rows before exercising scroll.
-    let divider_row = first_row.saturating_add(2);
+    // The default top Work surface is three rows tall: one pinned progress
+    // receipt, one selectable row, and the visible divider. Send genuine SGR
+    // down/drag/up bytes and prove the resized surface exposes additional real
+    // rows before exercising scroll.
+    let divider_row = first_row.saturating_add(1);
     h.send(keys::mouse::down(divider_row, first_col))?;
-    h.send(keys::mouse::drag(divider_row.saturating_add(3), first_col))?;
-    h.send(keys::mouse::up(divider_row.saturating_add(3), first_col))?;
+    h.send(keys::mouse::drag(divider_row.saturating_add(4), first_col))?;
+    h.send(keys::mouse::up(divider_row.saturating_add(4), first_col))?;
     h.wait_for_text("todo-mouse-04", KEY_TIMEOUT)?;
 
     for _ in 0..8 {
@@ -1557,7 +1558,9 @@ fn legacy_work_ctrl_t_save_export_and_restart_are_consistent() -> anyhow::Result
     h.wait_for_text("To-do ·", KEY_TIMEOUT)?;
     h.wait_for_idle(Duration::from_millis(250), Duration::from_secs(3))?;
     assert!(
-        h.frame().contains("persisted"),
+        h.frame().contains("To-do · 1/3 · 2 left")
+            && h.frame().contains("1 ·")
+            && h.frame().contains("verify integrated PTY"),
         "{}",
         h.frame().debug_dump()
     );
@@ -1654,7 +1657,13 @@ fn legacy_work_ctrl_t_save_export_and_restart_are_consistent() -> anyhow::Result
     restored.wait_for_text("To-do ·", KEY_TIMEOUT)?;
     restored.wait_for_idle(Duration::from_millis(250), Duration::from_secs(3))?;
     let frame = restored.frame();
-    assert!(frame.contains("persisted"), "{}", frame.debug_dump());
+    assert!(
+        frame.contains("To-do · 1/3 · 2 left")
+            && frame.contains("1 ·")
+            && frame.contains("verify integrated PTY"),
+        "{}",
+        frame.debug_dump()
+    );
     assert!(
         frame.row(0).contains(" · high ") && frame.row(0).contains("Full Access"),
         "restart lost narrow effort/permission truth:\n{}",
