@@ -484,7 +484,7 @@ fn underwater_motion_ticks_only_for_visible_unobscured_owners() {
         true,
         false,
     ));
-    assert!(!underwater_motion_surface_visible(
+    assert!(underwater_motion_surface_visible(
         Some(Rect::new(0, 0, 60, 16)),
         false,
         false,
@@ -1802,7 +1802,7 @@ fn mouse_selection_autocopies_on_release_without_ctrl_c() {
 }
 
 #[test]
-fn loading_mouse_filter_keeps_active_drags() {
+fn loading_mouse_filter_keeps_hover_and_active_drags() {
     let mut app = create_test_app();
     app.is_loading = true;
 
@@ -1819,7 +1819,7 @@ fn loading_mouse_filter_keeps_active_drags() {
         modifiers: KeyModifiers::NONE,
     };
 
-    assert!(should_drop_loading_mouse_motion(&app, moved));
+    assert!(!should_drop_loading_mouse_motion(&app, moved));
     assert!(should_drop_loading_mouse_motion(&app, drag));
 
     app.viewport.transcript_selection.dragging = true;
@@ -1972,7 +1972,7 @@ fn loading_mouse_filter_allows_sidebar_exit_to_clear_highlight() {
     handle_mouse_event(&mut app, exit_left);
 
     assert_eq!(app.last_mouse_pos, Some((59, 5)));
-    assert!(should_drop_loading_mouse_motion(
+    assert!(!should_drop_loading_mouse_motion(
         &app,
         MouseEvent {
             kind: MouseEventKind::Moved,

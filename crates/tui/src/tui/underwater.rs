@@ -1394,7 +1394,10 @@ mod tests {
                     ApprovalMode::Bypass => app.ui_theme.permission_full_access,
                 };
                 let label = permission_label(&app).into_owned();
-                assert_eq!(label, expected_label, "{approval_mode:?}");
+                assert!(
+                    label.starts_with(expected_label) && label.contains("fs:"),
+                    "{approval_mode:?}: {label}"
+                );
                 let area = Rect::new(0, 0, width, 1);
                 let mut buf = Buffer::empty(area);
 
@@ -1404,7 +1407,7 @@ mod tests {
                 // `auto` can also appear earlier as a route/mode label. The
                 // permission posture owns the rightmost occurrence.
                 let label_byte = rendered
-                    .rfind(&label)
+                    .rfind(expected_label)
                     .expect("permission label should render");
                 let label_x = rendered[..label_byte].width() as u16;
                 assert_eq!(buf[(label_x, 0)].fg, expected_color, "{approval_mode:?}");

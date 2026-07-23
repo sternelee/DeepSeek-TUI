@@ -6215,8 +6215,8 @@ mod tests {
         let rendered = buffer_text(&buf, area);
         let fish_count = rendered.matches("><>").count() + rendered.matches("<><").count();
         assert_eq!(
-            fish_count, 3,
-            "wide idle water should contain three fish:\n{rendered}"
+            fish_count, 8,
+            "wide idle water should contain two cohesive four-fish schools:\n{rendered}"
         );
 
         let context = "codewhale · /tmp/codewhale-test-workspace · no git · mcp 0";
