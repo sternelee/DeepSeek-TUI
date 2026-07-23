@@ -5829,11 +5829,7 @@ base_url = "https://api.xiaomimimo.com/v1"
     fn model_row_hint_names_the_model_picker() {
         let app = create_test_app();
         let mut view = ConfigView::new_for_app(&app);
-        view.selected = view
-            .rows
-            .iter()
-            .position(|row| row.key == "model")
-            .expect("model row");
+        view.focus_key("model");
 
         let hint = view.selected_row_hint().expect("model row hint");
         assert!(hint.contains("Enter opens model picker"), "{hint}");
