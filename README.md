@@ -1,31 +1,19 @@
 # Codewhale
 
-**One runtime. Supported hosted and local models. Your machine.**
+A coding agent for your terminal. Point it at a model — DeepSeek, Claude,
+GPT, Kimi, GLM, 30+ hosted providers, or your own vLLM/SGLang/Ollama, no
+key required — and give it a task. It reads your code, edits files, runs
+commands, checks its work, and stops when it's done or needs you. Switch
+models mid-task with `/model`. Use the TUI for interactive work,
+`codewhale exec` for scripts and CI.
 
-Codewhale is a coding agent for your terminal. It works with supported hosted
-and local models; open models first. Give it a provider, a model, and a task: it reads your
-code, edits files, runs commands, checks its work, and stops when the job
-is done or it needs you. Switch models mid-task with `/model`. Use the TUI
-for interactive work, `codewhale exec` for scripts and CI. Rust, MIT,
-runs on your machine.
+Plan mode is read-only. Approvals gate risky commands, and a repo's
+`constitution.json` can pin write holds that even Full Access can't skip.
+Fleets log every step to a ledger, so `fleet resume` picks up where you
+left off.
 
-**Why Codewhale:**
-- **No lock-in.** DeepSeek, Claude, GPT, Kimi, GLM, 30+ providers, and your
-  own vLLM, SGLang, or Ollama — no key required — run through one runtime
-  and one toolset. Context budgets and prices come from the real route. An
-  unknown price shows as unknown, never as $0.
-- **Safe by construction.** Plan mode is read-only. Approvals gate every
-  risky call. Codewhale reports an OS command sandbox only when it actually
-  wraps the command: Seatbelt on macOS when available, and opt-in bubblewrap
-  on Linux when installed. Windows currently reports none. A repo's
-  `constitution.json` compiles into write holds that even Full Access cannot
-  skip.
-- **Work that survives.** Fleets record every step in an append-only
-  ledger; `fleet resume` picks up where you stopped. Every turn leaves a
-  receipt you can inspect.
-
-Born as `deepseek-tui`. Its community needed more providers, so we built
-one where the model is a component, not the product.
+Rust, MIT, runs on your machine. Started as `deepseek-tui`; renamed once
+the community wanted more providers than one.
 
 [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [codewhale.net](https://codewhale.net/) · [Docs](docs) · [Changelog](CHANGELOG.md)
 
@@ -77,12 +65,10 @@ architecture — is in [docs](docs) and on
 
 ## Contributing
 
-All feedback is a gift. Issues, PRs, repro steps, logs, feature requests, and
-first contributions are all real project work here. When a PR can't merge
-as-is, maintainers harvest what works and the author stays credited — in the
-commit, the changelog, and [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md). If a
-model or provider you use is missing, or something breaks on your machine,
-telling us is the most useful thing you can do.
+Issues, PRs, repro steps, and feature requests are all welcome. When a PR
+can't merge as-is, maintainers harvest what works and credit the author in
+the commit, the changelog, and [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md).
+Missing a provider, or something broke on your machine? Tell us.
 
 - [Open issues](https://github.com/Hmbown/CodeWhale/issues) — good first
   contributions live here

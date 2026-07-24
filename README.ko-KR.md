@@ -1,33 +1,21 @@
-<!-- source: README.md sha256:a14f7d3aa7d1 -->
+<!-- source: README.md sha256:ff4c58eb428c -->
 # Codewhale
 
-**하나의 런타임. 지원되는 호스팅 및 로컬 모델. 당신의 컴퓨터.**
+Codewhale은 터미널에서 쓰는 코딩 에이전트입니다. DeepSeek, Claude, GPT, Kimi,
+GLM 등 30개 이상의 호스팅 프로바이더, 또는 키 없이 쓰는 자체 vLLM, SGLang,
+Ollama — 모델을 지정하고 작업을 맡기면 코드를 읽고, 파일을 편집하고, 명령을
+실행하고, 스스로 작업을 확인하며, 작업이 끝나거나 사용자의 판단이
+필요해지면 멈춥니다. 작업 도중에도 `/model`로 모델을 바꿀 수 있습니다.
+대화형 작업에는 TUI를, 스크립트와 CI에는 `codewhale exec`를 사용합니다.
 
-Codewhale은 터미널에서 쓰는 코딩 에이전트입니다. 지원되는 호스팅 및 로컬
-모델과 함께 동작하며, 오픈 모델을 우선합니다. 프로바이더, 모델, 작업을 지정하면 코드를 읽고,
-파일을 편집하고, 명령을 실행하고, 스스로 작업을 확인하며, 작업이 끝나거나
-사용자의 판단이 필요해지면 멈춥니다. 작업 도중에도 `/model`로 모델을 바꿀
-수 있습니다. 대화형 작업에는 TUI를, 스크립트와 CI에는 `codewhale exec`를
-사용합니다. Rust로 작성, MIT 라이선스, 당신의 컴퓨터에서 실행됩니다.
+Plan 모드는 읽기 전용입니다. 위험한 명령은 승인을 거치며, 저장소의
+`constitution.json`으로 Full Access조차 건너뛸 수 없는 쓰기 제한을 걸 수
+있습니다. Fleet은 모든 단계를 원장에 기록하므로, `fleet resume`은 멈춘
+지점부터 이어갑니다.
 
-**Codewhale을 쓰는 이유:**
-- **종속 없음.** DeepSeek, Claude, GPT, Kimi, GLM 등 30개 이상의 프로바이더와
-  키 없이 쓰는 자체 vLLM, SGLang, Ollama가 하나의 런타임과 하나의 도구
-  세트를 통해 동작합니다. 컨텍스트 예산과 가격은 실제 라우트에서 가져오며,
-  알 수 없는 가격은 알 수 없음으로 표시됩니다 — 절대 $0으로 표시되지
-  않습니다.
-- **구조적으로 안전.** Plan 모드는 읽기 전용입니다. 위험한 호출은 모두
-  승인을 거칩니다. Codewhale은 명령이 실제로 래핑될 때만 OS 명령 샌드박스를
-  표시합니다. macOS에서는 사용 가능한 Seatbelt를, Linux에서는 설치되어 있고
-  명시적으로 활성화한 bubblewrap을 사용하며, Windows는 현재 샌드박스 없음으로
-  표시합니다. 저장소의 `constitution.json`은 Full Access조차 건너뛸 수 없는
-  쓰기 홀드로 컴파일됩니다.
-- **사라지지 않는 작업.** Fleet은 모든 단계를 추가 전용 원장에 기록하고,
-  `fleet resume`은 멈춘 지점부터 이어갑니다. 매 턴마다 확인할 수 있는
-  영수증이 남습니다.
-
-`deepseek-tui`로 태어났습니다. 커뮤니티가 더 많은 프로바이더를 필요로 했고,
-그래서 모델이 제품이 아니라 부품인 런타임을 만들었습니다.
+Rust로 작성, MIT 라이선스, 당신의 컴퓨터에서 실행됩니다. `deepseek-tui`로
+태어났고, 커뮤니티가 더 많은 프로바이더를 필요로 했을 때 이름을
+바꿨습니다.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [codewhale.net](https://codewhale.net/) · [Docs](docs) · [Changelog](CHANGELOG.md)
 
@@ -79,13 +67,12 @@ Ask / Auto-Review / Full Access 권한 태세를 순환합니다. `!`는 일반 
 
 ## 기여
 
-모든 피드백은 선물입니다. 이슈, PR, 재현 절차, 로그, 기능 요청, 첫
-기여는 모두 이곳에서 실제 프로젝트 작업입니다. PR을 그대로 병합할 수
+이슈, PR, 재현 절차, 기능 요청은 언제든 환영입니다. PR을 그대로 병합할 수
 없을 때는 메인테이너가 작동하는 부분을 거두어 반영하고, 작성자의
 크레딧은 커밋, 변경 로그,
 [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md)에 그대로 남습니다.
-사용하는 모델이나 프로바이더가 빠져 있거나 무언가가 여러분의 컴퓨터에서
-깨진다면, 그것을 알려 주는 일이 할 수 있는 가장 유용한 일입니다.
+사용하는 프로바이더가 빠져 있거나 여러분의 컴퓨터에서 무언가가
+깨졌나요? 알려 주세요.
 
 - [열려 있는 이슈](https://github.com/Hmbown/CodeWhale/issues) — 처음
   기여하기 좋은 작업이 여기에 있습니다

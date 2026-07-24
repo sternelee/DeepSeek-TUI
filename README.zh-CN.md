@@ -1,16 +1,11 @@
-<!-- source: README.md sha256:a14f7d3aa7d1 -->
+<!-- source: README.md sha256:ff4c58eb428c -->
 # Codewhale
 
-**一个运行时。支持的托管与本地模型。你的机器。**
+Codewhale 是运行在终端里的编程智能体。给它指定一个模型——DeepSeek、Claude、GPT、Kimi、GLM 等 30 多家托管 provider，或者你自己的 vLLM/SGLang/Ollama，无需 key——再交给它一个任务。它会读你的代码、改文件、跑命令、检查自己的工作，在任务完成或需要你介入时停下。任务中途用 `/model` 切换模型。交互式工作用 TUI，脚本和 CI 用 `codewhale exec`。
 
-Codewhale 是运行在终端里的编程智能体。适配受支持的托管与本地模型；开放模型优先。给它一个 provider、一个模型和一个任务：它会读你的代码、改文件、跑命令、检查自己的工作，在任务完成或需要你介入时停下。任务中途用 `/model` 切换模型。交互式工作用 TUI，脚本和 CI 用 `codewhale exec`。Rust 编写，MIT 许可，运行在你自己的机器上。
+Plan 模式只读。审批把关高风险命令，仓库的 `constitution.json` 可以设定写入拦截，连 Full Access 也无法跳过。Fleet 把每一步记录到账本里，`fleet resume` 从你停下的地方继续。
 
-**为什么选 Codewhale：**
-- **不被锁定。** DeepSeek、Claude、GPT、Kimi、GLM 等 30 多家 provider，以及你自己的 vLLM、SGLang、Ollama——无需 key——都跑在同一套运行时和同一套工具之上。上下文预算与价格取自真实路由；价格未知时显示未知，绝不显示 $0。
-- **安全靠构造。** Plan 模式只读。审批把关每一次高风险调用。Codewhale 只有在命令实际经由 OS 沙箱包装器运行时才报告沙箱：macOS 上是可用时启用的 Seatbelt，Linux 上是已安装且显式启用的 bubblewrap；Windows 当前报告无 OS 沙箱。仓库的 `constitution.json` 会编译成写入拦截，连 Full Access 也无法跳过。
-- **工作不丢失。** Fleet 把每一步记录在只追加的账本里；`fleet resume` 从你停下的地方继续。每一轮都留下可查验的回执。
-
-它诞生于 `deepseek-tui`。社区需要更多 provider，于是我们造了一个把模型当组件、而不是当产品的运行时。
+Rust 编写，MIT 许可，运行在你自己的机器上。前身是 `deepseek-tui`；社区需要不止一家 provider，于是改了名字。
 
 [English](README.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [codewhale.net](https://codewhale.net/) · [Docs](docs) · [Changelog](CHANGELOG.md)
 
@@ -50,7 +45,7 @@ codewhale web                            # local browser client on 127.0.0.1
 
 ## 贡献
 
-所有反馈都是礼物。Issue、PR、复现步骤、日志、功能请求和第一次贡献，在这里都算真实的项目工作。当一个 PR 无法原样合并时，维护者会吸收其中可用的部分，作者的署名会保留——在提交、更新日志和 [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md) 中。如果你在用的某个模型或 provider 还不支持，或者有什么东西在你机器上坏了，告诉我们就是你能做的最有用的事。
+欢迎提交 Issue、PR、复现步骤和功能请求。当一个 PR 无法原样合并时，维护者会吸收其中可用的部分，作者的署名会保留——在提交、更新日志和 [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md) 中。缺少你在用的 provider，或者有什么东西在你机器上坏了？告诉我们。
 
 - [开放 issue](https://github.com/Hmbown/CodeWhale/issues) —— 适合入门的贡献在这里
 - [CONTRIBUTING.md](CONTRIBUTING.md) —— 开发环境搭建与 PR 流程

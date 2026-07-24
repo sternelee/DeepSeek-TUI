@@ -1,34 +1,21 @@
-<!-- source: README.md sha256:a14f7d3aa7d1 -->
+<!-- source: README.md sha256:ff4c58eb428c -->
 # Codewhale
 
-**Um runtime. Modelos hospedados e locais compatíveis. Sua máquina.**
+O Codewhale é um agente de código para o seu terminal. Aponte-o para um
+modelo — DeepSeek, Claude, GPT, Kimi, GLM, mais de 30 provedores hospedados,
+ou seu próprio vLLM/SGLang/Ollama, sem key — e dê uma tarefa a ele. Ele lê
+seu código, edita arquivos, executa comandos, verifica o próprio trabalho e
+para quando a tarefa termina ou quando precisa de você. Troque de modelo no
+meio da tarefa com `/model`. Use a TUI para trabalho interativo e
+`codewhale exec` para scripts e CI.
 
-O Codewhale é um agente de código para o seu terminal. Funciona com modelos
-hospedados e locais compatíveis; modelos abertos em primeiro lugar. Você informa um provedor, um
-modelo e uma tarefa: ele lê seu código, edita arquivos, executa comandos,
-verifica o próprio trabalho e para quando a tarefa termina ou quando precisa
-de você. Troque de modelo no meio da tarefa com `/model`. Use a TUI para
-trabalho interativo e `codewhale exec` para scripts e CI. Rust, MIT, roda na
-sua máquina.
+O modo Plan é somente leitura. Aprovações controlam comandos arriscados, e o
+`constitution.json` de um repositório pode fixar bloqueios de escrita que
+nem o Full Access consegue pular. Fleets registram cada passo em um
+livro-razão, então `fleet resume` retoma de onde você parou.
 
-**Por que Codewhale:**
-- **Sem lock-in.** DeepSeek, Claude, GPT, Kimi, GLM, mais de 30 provedores, e
-  seu próprio vLLM, SGLang ou Ollama — sem key — rodam por um único runtime e
-  um único conjunto de ferramentas. Orçamentos de contexto e preços vêm da
-  rota real. Um preço desconhecido aparece como desconhecido, nunca como $0.
-- **Seguro por construção.** O modo Plan é somente leitura. Aprovações
-  controlam cada chamada arriscada. O Codewhale só informa um sandbox de
-  comandos do sistema operacional quando ele realmente envolve o comando:
-  Seatbelt no macOS quando disponível e bubblewrap opcional no Linux quando
-  instalado. O Windows atualmente informa que não há sandbox. O
-  `constitution.json` de um repositório é compilado em bloqueios de escrita
-  que nem o Full Access consegue pular.
-- **Trabalho que sobrevive.** Fleets registram cada passo em um livro-razão
-  de apenas inclusão; `fleet resume` retoma de onde você parou. Cada turno
-  deixa um recibo que você pode inspecionar.
-
-Nasceu como `deepseek-tui`. Sua comunidade precisava de mais provedores,
-então construímos um runtime em que o modelo é um componente, não o produto.
+Rust, MIT, roda na sua máquina. Nasceu como `deepseek-tui`; mudou de nome
+quando a comunidade precisou de mais de um provedor.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [codewhale.net](https://codewhale.net/) · [Docs](docs) · [Changelog](CHANGELOG.md)
 
@@ -80,13 +67,11 @@ runtime, arquitetura — está em [docs](docs) e em
 
 ## Contribuindo
 
-Todo feedback é um presente. Issues, PRs, passos de reprodução, logs, pedidos
-de funcionalidade e primeiras contribuições — tudo isso é trabalho real do
-projeto aqui. Quando um PR não pode ser mesclado como está, os mantenedores
-aproveitam o que funciona e o autor continua creditado — no commit, no
-changelog e em [docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md). Se um modelo ou
-provedor que você usa está faltando, ou se algo quebra na sua máquina, nos
-contar é a coisa mais útil que você pode fazer.
+Issues, PRs, passos de reprodução e pedidos de funcionalidade são bem-vindos.
+Quando um PR não pode ser mesclado como está, os mantenedores aproveitam o
+que funciona e o autor continua creditado — no commit, no changelog e em
+[docs/CONTRIBUTORS.md](docs/CONTRIBUTORS.md). Falta um provedor que você usa,
+ou algo quebrou na sua máquina? Nos conte.
 
 - [Issues abertas](https://github.com/Hmbown/CodeWhale/issues) — boas
   primeiras contribuições moram aqui
