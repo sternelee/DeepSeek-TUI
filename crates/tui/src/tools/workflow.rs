@@ -1212,9 +1212,101 @@ async fn run_workflow_vm(
     } else {
         state.mark_owner_missing(&run_id);
     }
+    write_run_report_artifact(&context.workspace, &snapshot);
     if let Ok(mut controllers_guard) = state.controllers.lock() {
         controllers_guard.remove(&run_id);
     }
+}
+
+/// Persist a durable per-run report under `.codewhale/reports/<run_id>.md`
+/// so a settled background run leaves one synthesized artifact even after
+/// the session ends. Best-effort: report IO never affects the run outcome.
+fn write_run_report_artifact(workspace: &Path, record: &WorkflowRunRecord) {
+    if !matches!(
+        record.status,
+        WorkflowRunStatus::Completed | WorkflowRunStatus::Failed | WorkflowRunStatus::Cancelled
+    ) {
+        return;
+    }
+    // Run ids are generated slugs, but never trust one as a path segment.
+    let safe_id: String = record
+        .run_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect();
+    if safe_id.is_empty() {
+        return;
+    }
+    let dir = workspace.join(".codewhale").join("reports");
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        crate::logging::warn(format!(
+            "workflow report dir {} not created: {err}",
+            dir.display()
+        ));
+        return;
+    }
+    let path = dir.join(format!("{safe_id}.md"));
+    if let Err(err) = std::fs::write(&path, render_run_report(record)) {
+        crate::logging::warn(format!(
+            "workflow report {} not written: {err}",
+            path.display()
+        ));
+    }
+}
+
+fn render_run_report(record: &WorkflowRunRecord) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Workflow run {}\n\n", record.run_id));
+    out.push_str(&format!("- status: {:?}\n", record.status));
+    if let Some(goal) = record.workflow_goal.as_deref() {
+        out.push_str(&format!("- goal: {goal}\n"));
+    }
+    if let Some(source) = record.source_path.as_deref() {
+        out.push_str(&format!("- source: {}\n", source.display()));
+    }
+    out.push_str(&format!("- started_at_ms: {}\n", record.started_at_ms));
+    if let Some(completed) = record.completed_at_ms {
+        out.push_str(&format!("- completed_at_ms: {completed}\n"));
+    }
+    if let Some(budget) = record.token_budget {
+        out.push_str(&format!("- token_budget: {budget}\n"));
+    }
+    out.push_str(&format!("- child_agents: {}\n", record.child_ids.len()));
+    if let Some(error) = record.error.as_deref() {
+        out.push_str(&format!("- error: {error}\n"));
+    }
+    if !record.gate_status.is_empty() {
+        out.push_str("\n## Gates\n\n");
+        for line in &record.gate_status {
+            out.push_str(&format!("- {line:?}\n"));
+        }
+    }
+    if !record.progress.is_empty() {
+        out.push_str("\n## Progress\n\n");
+        for line in &record.progress {
+            out.push_str(&format!("- {line}\n"));
+        }
+    }
+    if !record.schema_errors.is_empty() {
+        out.push_str(&format!(
+            "\n## Schema errors ({})\n\n",
+            record.schema_errors.len()
+        ));
+    }
+    if let Some(result) = record.result.as_ref() {
+        out.push_str("\n## Result\n\n```json\n");
+        out.push_str(&serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()));
+        out.push_str("\n```\n");
+    }
+    if let Some(verification) = record.verification.as_ref() {
+        out.push_str("\n## Verification\n\n```json\n");
+        out.push_str(
+            &serde_json::to_string_pretty(verification)
+                .unwrap_or_else(|_| verification.to_string()),
+        );
+        out.push_str("\n```\n");
+    }
+    out
 }
 
 fn workflow_result_for(
@@ -1643,9 +1735,19 @@ fn read_workflow_source_path(
             .workspace
             .canonicalize()
             .unwrap_or_else(|_| context.workspace.clone());
-        if !canonical.starts_with(&workspace) {
+        // The user-global saved-workflow store is a first-class source
+        // alongside the workspace: `~/.codewhale/workflows/*.workflow.js`
+        // definitions surface as slash commands and must launch from any
+        // workspace without trust_mode.
+        let home_store = dirs::home_dir()
+            .map(|home| home.join(".codewhale").join("workflows"))
+            .and_then(|dir| dir.canonicalize().ok());
+        let inside_home_store = home_store
+            .as_deref()
+            .is_some_and(|dir| canonical.starts_with(dir));
+        if !canonical.starts_with(&workspace) && !inside_home_store {
             return Err(ToolError::permission_denied(format!(
-                "workflow source_path must stay inside the workspace: {}",
+                "workflow source_path must stay inside the workspace or ~/.codewhale/workflows: {}",
                 canonical.display()
             )));
         }
@@ -3841,6 +3943,72 @@ mod tests {
     use axum::{Json, Router, routing::post};
     use codewhale_workflow::{IsolationMode, leaf_is_write_capable};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn settled_runs_leave_a_report_artifact_under_codewhale_reports() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut record = WorkflowRunRecord::new("workflow_report_1".to_string(), None, None, None);
+        record.status = WorkflowRunStatus::Completed;
+        record.workflow_goal = Some("prove the report artifact".to_string());
+        record.progress.push("phase: scan".to_string());
+        record.result = Some(serde_json::json!({"confirmed": 2}));
+
+        write_run_report_artifact(tmp.path(), &record);
+
+        let path = tmp
+            .path()
+            .join(".codewhale")
+            .join("reports")
+            .join("workflow_report_1.md");
+        let body = std::fs::read_to_string(&path).expect("report written");
+        assert!(body.contains("# Workflow run workflow_report_1"), "{body}");
+        assert!(body.contains("status: Completed"), "{body}");
+        assert!(body.contains("prove the report artifact"), "{body}");
+        assert!(body.contains("phase: scan"), "{body}");
+        assert!(body.contains("\"confirmed\": 2"), "{body}");
+    }
+
+    #[test]
+    fn running_runs_write_no_report_artifact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let record = WorkflowRunRecord::new("workflow_report_2".to_string(), None, None, None);
+        write_run_report_artifact(tmp.path(), &record);
+        assert!(
+            !tmp.path().join(".codewhale").join("reports").exists(),
+            "running runs must not leave report files"
+        );
+    }
+
+    #[test]
+    fn source_path_accepts_the_home_workflow_store_and_rejects_elsewhere() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let store = home.join(".codewhale").join("workflows");
+        std::fs::create_dir_all(&store).expect("store");
+        let _home_guard = crate::test_support::EnvVarGuard::set("HOME", &home);
+
+        let saved = store.join("triage.workflow.js");
+        std::fs::write(&saved, "phase('scan');\n").expect("write saved workflow");
+        let elsewhere = tmp.path().join("outside.workflow.js");
+        std::fs::write(&elsewhere, "phase('scan');\n").expect("write outside workflow");
+
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let context = ToolContext::new(workspace);
+
+        let resolved = read_workflow_source_path(saved.to_str().expect("utf8 path"), &context)
+            .expect("home workflow store is a first-class source");
+        assert!(resolved.source.contains("phase('scan')"));
+
+        let err = read_workflow_source_path(elsewhere.to_str().expect("utf8 path"), &context)
+            .expect_err("arbitrary outside paths stay denied");
+        assert!(
+            err.to_string()
+                .contains("workspace or ~/.codewhale/workflows"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn restored_workflow_binding_consumes_journal_recovery() {

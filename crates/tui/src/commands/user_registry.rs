@@ -105,7 +105,32 @@ impl UserCommandRegistry {
         // The user_commands module is the permanent lower-level file scanning
         // and parsing boundary; this registry owns metadata, shadowing, and
         // dispatch. See docs/architecture/command-dispatch.md.
-        Self::load_from_paths(&user_commands::commands_dirs(workspace))
+        Self::load_with_sources(
+            &user_commands::commands_dirs(workspace),
+            &user_commands::workflow_dirs(workspace),
+        )
+    }
+
+    pub(crate) fn load_with_sources(md_dirs: &[PathBuf], workflow_dirs: &[PathBuf]) -> Self {
+        let mut registry = Self::load_from_paths(md_dirs);
+
+        // Saved workflows become slash commands after explicit .md commands,
+        // so a hand-written command with the same name always wins without a
+        // noisy duplicate-definition warning.
+        let mut workflow_entries: Vec<(String, String, PathBuf)> = Vec::new();
+        for dir in workflow_dirs {
+            for (name, content, path) in user_commands::load_workflow_commands_from_dir(dir) {
+                if registry.get(&name).is_none()
+                    && !workflow_entries
+                        .iter()
+                        .any(|(existing, _, _)| *existing == name)
+                {
+                    workflow_entries.push((name, content, path));
+                }
+            }
+        }
+        registry.load_from_entries(workflow_entries);
+        registry
     }
 
     pub(crate) fn load_from_paths(paths: &[PathBuf]) -> Self {
@@ -427,35 +452,49 @@ fn normalize_workspace(workspace: Option<&Path>) -> Option<PathBuf> {
 fn command_dirs_snapshot(workspace: Option<&Path>) -> Vec<CommandDirSnapshot> {
     user_commands::commands_dirs(workspace)
         .into_iter()
-        .map(|path| {
-            let modified = std::fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            let mut files = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&path) {
-                for entry in entries.flatten() {
-                    let file_path = entry.path();
-                    if file_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-                        continue;
-                    }
-                    let Ok(metadata) = entry.metadata() else {
-                        continue;
-                    };
-                    files.push(CommandFileSnapshot {
-                        path: file_path,
-                        modified: metadata.modified().ok(),
-                        len: metadata.len(),
-                    });
-                }
-            }
-            files.sort_by(|a, b| a.path.cmp(&b.path));
-            CommandDirSnapshot {
-                path,
-                modified,
-                files,
-            }
-        })
+        .map(|path| snapshot_dir(path, |name| name.ends_with(".md")))
+        .chain(
+            user_commands::workflow_dirs(workspace)
+                .into_iter()
+                .map(|path| {
+                    snapshot_dir(path, |name| {
+                        name.ends_with(user_commands::WORKFLOW_SOURCE_SUFFIX)
+                    })
+                }),
+        )
         .collect()
+}
+
+fn snapshot_dir(path: PathBuf, matches: impl Fn(&str) -> bool) -> CommandDirSnapshot {
+    let modified = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&path) {
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !matches(file_name) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            files.push(CommandFileSnapshot {
+                path: file_path,
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    CommandDirSnapshot {
+        path,
+        modified,
+        files,
+    }
 }
 
 fn registry_lock() -> &'static RwLock<UserCommandRegistryState> {
@@ -600,6 +639,64 @@ pub fn try_dispatch(app: &mut App, input: &str) -> Option<CommandResult> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn saved_workflows_become_arg_taking_slash_commands() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workflow_dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(
+            workflow_dir.join("pr-review.workflow.js"),
+            "// Review a PR across dimensions and verify findings\nphase('scan');\n",
+        )
+        .expect("write workflow");
+
+        let registry = UserCommandRegistry::load_with_sources(&[], &[workflow_dir.clone()]);
+        let command = registry.get("pr-review").expect("workflow command");
+        assert_eq!(
+            command.description.as_deref(),
+            Some("Review a PR across dimensions and verify findings")
+        );
+        assert!(command.takes_arguments(), "workflows accept custom args");
+        assert!(
+            command.body.contains("source_path=")
+                && command.body.contains(
+                    &workflow_dir
+                        .join("pr-review.workflow.js")
+                        .display()
+                        .to_string()
+                ),
+            "body must point the workflow tool at the saved source: {}",
+            command.body
+        );
+        assert!(
+            command.body.contains("$ARGUMENTS"),
+            "slash arguments must forward into the run: {}",
+            command.body
+        );
+    }
+
+    #[test]
+    fn explicit_md_commands_shadow_same_named_workflows_quietly() {
+        let tmp = TempDir::new().expect("tempdir");
+        let md_dir = tmp.path().join("commands");
+        let workflow_dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&md_dir).expect("md dir");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(md_dir.join("triage.md"), "hand-written triage $ARGUMENTS")
+            .expect("write md command");
+        std::fs::write(workflow_dir.join("triage.workflow.js"), "phase('x');\n")
+            .expect("write workflow");
+
+        let registry = UserCommandRegistry::load_with_sources(&[md_dir], &[workflow_dir]);
+        let command = registry.get("triage").expect("command");
+        assert_eq!(command.body, "hand-written triage $ARGUMENTS");
+        assert!(
+            registry.load_errors().is_empty(),
+            "shadowing a workflow is silent, not a duplicate-definition warning: {:?}",
+            registry.load_errors()
+        );
+    }
 
     #[test]
     fn registry_loads_markdown_metadata() {

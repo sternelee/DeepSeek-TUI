@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Saved workflows become slash commands: `*.workflow.js` files under
+  `<workspace>/.codewhale/workflows/` and `~/.codewhale/workflows/` are
+  discovered as `/name` commands that accept custom arguments (forwarded
+  to the run's `args`), launch through the `workflow` tool in the
+  background, and report their run id. Hand-written `.md` commands with
+  the same name always win. The workflow tool's `source_path` now also
+  accepts the user-global `~/.codewhale/workflows/` store, and every
+  settled run leaves a durable synthesized report under
+  `.codewhale/reports/<run_id>.md` (status, goal, gates, progress,
+  result, verification).
+
 ### Fixed
 
 - Disambiguate the two Kimi K3 model-picker rows, which read as an
